@@ -404,3 +404,45 @@ def test_sampling_frequencies_match_the_renormalized_distribution(device):
     expected = torch.tensor(probs, device=device)
     # 4-sigma binomial band, widest at p=0.4
     assert (freq - expected).abs().max().item() < 4 * math.sqrt(0.4 * 0.6 / n)
+
+
+# --- specified tie-break: lowest token id wins ------------------------------
+
+def test_ties_resolve_to_the_lowest_token_id(device):
+    x = torch.zeros(1, 64, device=device)
+    x[0, ::2] = 1.0
+    s = sample_eager(x, 8, 1.0, generator=gen(device), return_stages=True)
+    assert s.topk_ids[0].tolist() == [0, 2, 4, 6, 8, 10, 12, 14]
+
+
+def test_boundary_tie_keeps_the_lowest_ids_of_the_tied_group(device):
+    x = torch.zeros(1, 20, device=device)
+    x[0, 3:12] = 5.0
+    s = sample_eager(x, 5, 1.0, generator=gen(device), return_stages=True)
+    assert s.topk_ids[0].tolist() == [3, 4, 5, 6, 7]
+
+
+def test_tie_break_is_identical_on_cpu_and_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("no cuda")
+    torch.manual_seed(0)
+    x = (torch.randn(64, 4000) * 4).to(torch.bfloat16)
+    a = sample_eager(x, 50, 0.95, generator=gen("cpu"), return_stages=True)
+    b = sample_eager(x.cuda(), 50, 0.95, generator=gen("cuda"), return_stages=True)
+    assert torch.equal(a.topk_ids, b.topk_ids.cpu())
+    assert torch.equal(a.cutoff, b.cutoff.cpu())
+
+
+def test_tie_break_is_stable_across_repeated_calls(device):
+    torch.manual_seed(0)
+    x = (torch.randn(32, 4000, device=device) * 4).to(torch.bfloat16)
+    a = sample_eager(x, 50, 0.95, generator=gen(device), return_stages=True)
+    b = sample_eager(x, 50, 0.95, generator=gen(device), return_stages=True)
+    assert torch.equal(a.topk_ids, b.topk_ids)
+
+
+def test_full_tie_selects_the_k_lowest_ids(device):
+    x = torch.zeros(4, 500, device=device)
+    s = sample_eager(x, 50, 1.0, generator=gen(device), return_stages=True)
+    expected = torch.arange(50, device=device).expand(4, 50)
+    assert torch.equal(s.topk_ids, expected)
