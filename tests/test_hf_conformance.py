@@ -1,3 +1,6 @@
+import csv
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -71,18 +74,52 @@ def test_tie_free_rows_are_rare_in_half_precision(device, dtype):
     assert tie_free_rows(x, 50).float().mean().item() < 0.5
 
 
+def tv(a, b):
+    return 0.5 * (a - b).abs().sum(-1)
+
+
+# --- Gate B: fidelity to FP32, which is the truth HF only approximates -------
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_half_precision_divergence_from_hf_stays_bounded(device, dtype):
-    # boundary ties are routine in the target regime -- ~95% of bf16 rows at V=128K, k=50 -- so
-    # the fixed-K contract cannot match HF row-for-row. What it must do is stay close: the tied
-    # tokens are the lowest-probability members of the nucleus. Measured 2026-08-22 at V=128256:
-    # bf16 max TV 0.037 / mean 0.006, fp16 max TV 0.013 / mean 0.001.
+@pytest.mark.parametrize("top_p", [0.90, 0.95, 1.0])
+def test_fixed_k_is_closer_to_fp32_truth_than_hf(device, dtype, top_p):
+    # the gate that matters. HF's top-k is value-thresholded, so in low precision it admits
+    # tokens that are not in the true top-k -- quantization noise promoted to candidates.
+    # Keeping exactly k discards that noise, and the result is measurably nearer the FP32
+    # answer both are approximating. Committed evidence: results/raw/tie_fidelity.csv
+    torch.manual_seed(0)
+    x32 = torch.randn(64, 4000, device=device) * 4
+    xq = x32.to(dtype)
+    truth = scatter_to_vocab(
+        sample_eager(x32, 50, top_p, generator=gen(device), return_stages=True), 4000, device
+    )
+    ours = scatter_to_vocab(
+        sample_eager(xq, 50, top_p, generator=gen(device), return_stages=True), 4000, device
+    )
+    assert tv(ours, truth).mean() <= tv(hf_probs(xq, 50, top_p), truth).mean()
+
+
+def test_committed_tie_fidelity_artifact_shows_no_losses():
+    path = Path(__file__).resolve().parents[1] / "results/raw/tie_fidelity.csv"
+    rows = list(csv.DictReader(path.open()))
+    assert len(rows) == 18
+    losses = [r for r in rows if r["ours_closer_to_fp32"] != "1"]
+    assert not losses, f"{len(losses)} configs where HF is nearer FP32 than fixed-k"
+    for r in rows:
+        assert float(r["ours_tv_vs_fp32_mean"]) <= float(r["hf_tv_vs_fp32_mean"])
+
+
+# --- reported, not gated: distance from HF ----------------------------------
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_distance_from_hf_stays_within_its_recorded_envelope(dtype, device):
+    # a tripwire on a *reported* quantity, not a correctness gate. HF is not ground truth in
+    # low precision (see Gate B), so drifting away from it is not by itself a defect -- but an
+    # unexplained jump means something changed, and this catches that.
     torch.manual_seed(0)
     x = (torch.randn(64, 4000, device=device) * 4).to(dtype)
     s = sample_eager(x, 50, 0.95, generator=gen(device), return_stages=True)
-    mine = scatter_to_vocab(s, x.shape[-1], device)
-    tv = 0.5 * (mine - hf_probs(x, 50, 0.95)).abs().sum(-1)
-    assert tv.max().item() < 0.05
+    assert tv(scatter_to_vocab(s, 4000, device), hf_probs(x, 50, 0.95)).max().item() < 0.05
 
 
 @pytest.mark.parametrize("batch", [1, 2, 8, 32])

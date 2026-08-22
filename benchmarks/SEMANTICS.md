@@ -65,19 +65,36 @@ shift has to answer, each verified against installed source the same way HF was:
 eager path; a production engine's sampler is not. Any headline carried across phases must be
 re-measured, and the write-up must name which engine a number is against.
 
-### What conformance means
+### What conformance means — two gates, deliberately separate
 
-Bit-exact agreement with the contract engine is **not** the gate — see RNG and Determinism, and
-see the tie policy for why it is not even available in the target dtypes. The gate is:
+Bit-exact agreement with the contract engine is **not** the gate, and in the target dtypes it is
+not even available (see the tie policy). Conflating "is the kernel correct" with "does it match
+HF" would make both questions unanswerable, so they are split.
 
-1. **Exact distributional agreement** where no tie straddles a decision boundary. On FP32 logits
-   this is 100% of rows and holds to ~1e-8.
-2. **Bounded total-variation distance** otherwise, with the bound measured and recorded, not
-   assumed.
-3. **Exact agreement on the deterministic paths** — `top_k=1`, one-hot logits — where the
-   sampler's RNG stream is irrelevant.
+**Gate A — kernel correctness. Kernel vs `reference.py`, exact.**
 
-`tests/test_hf_conformance.py` is that gate for Phase 1.
+The kernel must reproduce the reference's candidate ids, nucleus, and renormalized probabilities
+exactly, at the same dtype and on the same device. This is engine-independent and survives the
+Phase 2 switch untouched. It is only possible because the tie-break is specified: with
+`torch.topk`'s unspecified ordering, ~93% of BF16 rows at `k=50` could only be tested
+distributionally, which is precisely where a weak gate would hide a real bug.
+
+**Gate B — semantic fidelity. Measured against FP32, not against HF.**
+
+The pass condition is *"fixed-`k` in low precision is at least as close to the FP32 result as the
+contract engine is"* — not *"fixed-`k` matches the contract engine"*. HF is the contract for the
+**shape and cost** of the operation, not the authority on its low-precision numerics, where it is
+measurably the worse approximation. Evidence: `results/raw/tie_fidelity.csv`, 18/18 configurations,
+regenerate with `python -m benchmarks.tie_fidelity`.
+
+**TV distance from HF is reported, never gated.** It is carried in the artifact and guarded by a
+loose tripwire so an unexplained jump is caught, but drifting from HF is not by itself a defect.
+Any write-up quoting fidelity must give the FP32 comparison, not only the HF one.
+
+Exact agreement with HF is still required on the paths where no tie and no RNG stream is involved
+— `top_k=1`, one-hot logits — and on FP32 inputs, where the two agree to ~1e-8 across the regime.
+
+`tests/test_hf_conformance.py` implements both gates for Phase 1.
 
 ## Signature
 
@@ -126,39 +143,42 @@ this is a correctness requirement, not a tuning knob.
 `k = min(top_k, V)` largest logits per row, **sorted descending**, carrying original vocabulary
 indices. Sorted order is required — every later stage depends on it.
 
-**Tie policy: exactly `k` candidates, values deterministic, index selection among ties
-implementation-defined.** Which of several equal-valued tokens is retained is not specified, and
-`torch.topk` does not document its tie-break. The kernel must match *retained logit values*, not
-*retained indices*, and must be self-consistent (identical output for identical input, shape, and
-seed on a given device). Tests assert on values and distributions, never on tie-broken indices.
+**Tie policy: exactly `k` candidates; ties resolve to the lowest token id.**
 
-**This is the one place the Phase 1 contract is knowingly broken, and it is not a corner case.**
+Both halves are now specified, and neither is implementation-defined any more.
 
-HF's top-k is *value-thresholded*: `scores < topk(scores, k).values[..., -1]`. Every token tied
-with the k-th value survives, so HF can retain **more than k** candidates. A fixed-`K`,
-register-resident kernel — the entire premise of this project — structurally cannot. Measured at
-`V=128256, k=50, batch=256` on 2026-08-22:
+**Exactly `k`.** HF's top-k is *value-thresholded* (`scores < topk(scores, k).values[..., -1]`), so
+every token tied with the k-th value survives and HF can retain **more than k** candidates. This
+repo keeps exactly `k`. The divergence is real and, in the target dtypes, routine rather than
+exceptional — measured at `V=128256, batch=512` on 2026-08-22:
 
-| dtype | rows with a boundary tie | HF candidates retained | rows differing from HF | max TV distance | mean TV |
-|---|---|---|---|---|---|
-| FP32 | ~0% | 50 | ~0% | ~1e-8 | ~1e-8 |
-| FP16 | 24-30% | 50-52 | 13-14% | 0.013 | 0.0009 |
-| BF16 | 95-96% | 51-55 | 62-71% | 0.037 | 0.006 |
+| dtype | k | rows with a boundary tie | tie multiplicity (median / max) |
+|---|---|---|---|
+| FP16 | 20 / 50 / 100 | 13% / 31% / 48% | 1 / 4 |
+| BF16 | 20 / 50 / 100 | 69% / 93% / 99% | 4 / 16 |
 
-Tie-free rows — no duplicate among the k candidates *and* no outside token equal to the k-th value
-— are **100% of FP32 rows, ~2-4% of FP16 rows, and 0% of BF16 rows** at `V=4000, k=50`. Exact HF
-conformance is therefore not available in the target dtypes at all; it is an FP32-only property.
+**Exactly `k` is not a concession — it is the more accurate choice.** Those tokens are not really
+tied: in FP32 they hold distinct values and do not belong in the top `k`. Half-precision
+quantization collapses them into one bucket, and HF's threshold formulation promotes that
+quantization noise into extra candidates. Keeping exactly `k` discards the noise. Measured against
+the FP32 result both are approximating, fixed-`k` is nearer in **18 of 18** swept configurations,
+on mean and max TV alike — `results/raw/tie_fidelity.csv`. Temperature does not change this: BF16
+ties are a *relative*-precision limit, so scaling logits leaves tie density essentially unchanged.
 
-There are two boundaries a tie can straddle, and both were observed:
-- **the k-boundary** — HF keeps all tied tokens, this repo keeps exactly `k`
-- **the top-p cutoff** — with equal probabilities inside the nucleus, HF's ascending sort and this
-  repo's descending `topk` disagree about *which* tied token is the last one kept. Same nucleus
-  size, same probability values, different token id.
+The information is destroyed in the input logits before the kernel sees them; no design choice
+recovers the FP32 ordering. The only question is how to resolve an inherited ambiguity, and this
+resolution is the one that stays closer to the intended operation.
 
-The divergence is bounded and small because tied tokens at a boundary are by construction the
-lowest-probability members of the nucleus. **The contract is therefore distributional, not
-row-exact** — `test_half_precision_divergence_from_hf_stays_bounded` asserts TV < 0.05. Whether
-that is the right resolution is an open decision, recorded below.
+**Lowest token id wins.** Among equal values the lower vocabulary index is retained and ordered
+first. `reference.py` gets this from a stable descending sort rather than `torch.topk`, whose tie
+order is unspecified and **differs between CPU and CUDA** — unusable as a target where ties are the
+norm. The kernel gets the same semantics for free by comparing `(value, id)` lexicographically in
+its candidate selection; it does not need a full sort, and the reference's sort is a
+clarity-over-speed choice in the reference only.
+
+There are two boundaries a tie can straddle, and both are covered by this rule:
+- **the k-boundary** — which tied tokens enter the candidate set
+- **the top-p cutoff** — which tied token is the last one kept inside the nucleus
 
 ### 2. Softmax — over the k survivors, not the vocabulary
 
@@ -218,6 +238,9 @@ index is the emitted token id.
   The generator's device must match the logits' device.
 - **Determinism contract: same seed + same input + same shape + same device -> same output.** This
   is what the tests assert.
+- **Candidate selection is fully deterministic and RNG-independent.** With the tie-break
+  specified, the candidate ids, nucleus, and renormalized probabilities are a pure function of
+  (logits, top_k, top_p) — identical on CPU and CUDA. Only the final draw consumes randomness.
 - **Bit-exact agreement with `torch.multinomial` is explicitly NOT required of the fused kernel.**
   The kernel will consume its own RNG stream (likely Philox in-kernel) and cannot be expected to
   reproduce PyTorch's sampler draw-for-draw. The kernel's correctness gate is *distributional* —
@@ -257,21 +280,12 @@ the kernel against its own baseline.
 
 Not yet decided; nothing below is assumed by the current code.
 
-**Needs a decision before kernel work — the boundary-tie resolution.** Three options, and they
-imply different kernel architectures:
-
-1. **Exactly `k`, ties broken arbitrarily** (current behavior). Keeps the fixed-`K` register design
-   intact. Accepts a bounded distributional gap from HF: TV up to 0.037 in BF16, affecting ~2/3 of
-   rows. The gap shrinks to nothing in FP32.
-2. **Match HF exactly** — retain every token tied at the k-boundary. Requires a variable-length
-   candidate set, which is the specific thing a register-resident fixed-`K` design cannot do.
-   Abandons the project's central performance premise to match a behavior that is arguably an
-   artifact of HF's threshold formulation rather than an intended semantic.
-3. **Declare the gap and gate on it** — keep option 1, but make the measured TV bound a committed
-   artifact and a regression test, and state it in any write-up.
-
-Option 3 is what the code currently does; option 1 vs 2 is the user's call, and it should be made
-before the kernel's candidate-management strategy is fixed.
+**Resolved 2026-08-22 — the boundary-tie question.** Fixed-`k` with a lowest-id tie-break, and
+the gate split into Gate A (exact vs the reference) and Gate B (fidelity vs FP32). Decided on
+measurement, not preference: fixed-`k` is closer to FP32 truth than HF in 18/18 configurations, and
+variable-`k` has no safe static bound — an all-equal-logits row makes HF retain all 128,256 tokens,
+so a variable design needs a cap anyway and inherits the fixed-`K` constraint plus a spill path
+that defeats register residency. Full reasoning in the tie policy above.
 
 **Other open items:**
 
