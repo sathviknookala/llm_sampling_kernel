@@ -6,6 +6,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from . import harness
+from .regime import ANCHOR_TOP_K, ANCHOR_TOP_P, ANCHOR_VOCAB
 from .implementations import (
     EAGER_FNS,
     PROBS_INPUT_IMPLS,
@@ -35,9 +36,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/raw/launch_counts.csv")
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 8, 32])
-    ap.add_argument("--vocab", type=int, default=151936)
-    ap.add_argument("--top-k", type=int, default=50)
-    ap.add_argument("--top-p", type=float, default=0.90)
+    ap.add_argument("--vocab", type=int, default=ANCHOR_VOCAB)
+    ap.add_argument("--top-k", type=int, default=ANCHOR_TOP_K)
+    ap.add_argument("--top-p", type=float, default=ANCHOR_TOP_P)
     args = ap.parse_args(argv)
 
     commit = harness.git_commit()

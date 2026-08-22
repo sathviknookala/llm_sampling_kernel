@@ -8,6 +8,7 @@ import torch
 
 from .hf_baseline import hf_probs
 from .reference import sample_eager
+from .regime import BENCH_TOP_K_VALUES, FIDELITY_VOCAB, TOP_P_VALUES
 
 FIELDS = [
     "dtype", "vocab", "batch", "top_k", "top_p",
@@ -75,7 +76,7 @@ def git_commit():
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/raw/tie_fidelity.csv")
-    ap.add_argument("--vocab", type=int, default=128256)
+    ap.add_argument("--vocab", type=int, default=FIDELITY_VOCAB)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -88,8 +89,8 @@ def main(argv=None):
 
     rows = []
     for dtype in (torch.float16, torch.bfloat16):
-        for top_k in (20, 50, 100):
-            for top_p in (0.90, 0.95, 1.0):
+        for top_k in BENCH_TOP_K_VALUES:
+            for top_p in TOP_P_VALUES:
                 row = measure(logits32, dtype, top_k, top_p, generator)
                 row["git_commit"] = commit
                 rows.append(row)

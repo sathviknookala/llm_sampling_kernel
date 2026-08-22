@@ -7,6 +7,16 @@ from pathlib import Path
 import torch
 
 from . import harness
+from .regime import (
+    ANCHOR_TOP_K,
+    ANCHOR_TOP_P,
+    ANCHOR_VOCAB,
+    BENCH_BATCH_SIZES,
+    BENCH_TOP_K_VALUES,
+    BENCH_TOP_P_VALUES,
+    LOGIT_DTYPES,
+    VOCAB_SIZES,
+)
 from .implementations import (
     EAGER_FNS,
     PROBS_INPUT_IMPLS,
@@ -101,14 +111,14 @@ def run_cell(impl_name, batch, vocab, top_k, top_p, dtype, hot, l2_bytes, bw, re
 def cells(args):
     """Main sweep at the anchor point, plus a parameter-sensitivity slice."""
     out = []
-    for dtype in (torch.float16, torch.bfloat16):
+    for dtype in LOGIT_DTYPES:
         for hot in (True, False):
             for batch in args.batches:
-                out.append((batch, args.anchor_vocab, 50, 0.90, dtype, hot))
+                out.append((batch, args.anchor_vocab, ANCHOR_TOP_K, ANCHOR_TOP_P, dtype, hot))
     for vocab in args.vocabs:
-        for top_k in (20, 50, 100):
-            for top_p in (0.90, 0.95):
-                for batch in (1, 32):
+        for top_k in BENCH_TOP_K_VALUES:
+            for top_p in BENCH_TOP_P_VALUES:
+                for batch in (min(args.batches), max(args.batches)):
                     out.append((batch, vocab, top_k, top_p, torch.bfloat16, True))
     seen, uniq = set(), []
     for c in out:
@@ -124,9 +134,9 @@ def main(argv=None):
     ap.add_argument("--out", default="results/raw/sampling_ladder.csv")
     ap.add_argument("--env-out", default="results/raw/environment.json")
     ap.add_argument("--impls", nargs="+", default=None)
-    ap.add_argument("--batches", type=int, nargs="+", default=[1, 4, 8, 16, 32])
-    ap.add_argument("--vocabs", type=int, nargs="+", default=[128256, 151936])
-    ap.add_argument("--anchor-vocab", type=int, default=151936)
+    ap.add_argument("--batches", type=int, nargs="+", default=list(BENCH_BATCH_SIZES))
+    ap.add_argument("--vocabs", type=int, nargs="+", default=list(VOCAB_SIZES))
+    ap.add_argument("--anchor-vocab", type=int, default=ANCHOR_VOCAB)
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--rounds", type=int, default=3)
     args = ap.parse_args(argv)

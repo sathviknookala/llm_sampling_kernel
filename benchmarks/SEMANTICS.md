@@ -48,9 +48,17 @@ Two consequences worth stating explicitly:
 ### Phase 2 (planned) — vLLM / FlashInfer
 
 When the kernel is validated against Phase 1, the contract shifts to a production serving engine
-and **this section gets rewritten before any number is quoted against it**. Neither `vllm` nor
-`flashinfer` is installed, so nothing about their internals is asserted here. The questions the
-shift has to answer, each verified against installed source the same way HF was:
+and **this section gets rewritten before any number is quoted against it**.
+
+**FlashInfer 0.6.17 is now installed and benchmarked**, but as a *performance* rung only — see
+`docs/benchmark_methodology.md` and `results/DECISION.md`. It is **not** the contract yet: its
+semantics differ (top-k/top-p applied to the full-vocabulary distribution, where this repo
+renormalizes within the top-k survivors first), and it lives in an isolated venv because its wheel
+requires a CUDA version this driver cannot run. `vllm` is still not installed, and nothing about
+vLLM's internals is asserted anywhere in this repo.
+
+Making FlashInfer the *contract* rather than a rung still requires answering, each verified against
+installed source the same way HF was:
 
 - Does the engine apply top-k/top-p to logits or to post-softmax probabilities, and in what order?
 - Does it sample via `multinomial`, or via a Gumbel/exponential trick, or via rejection sampling
@@ -289,10 +297,20 @@ that defeats register residency. Full reasoning in the tie policy above.
 
 **Other open items:**
 
+**Settled 2026-08-22 by the benchmark rig** (`results/DECISION.md`):
+
+- **Temperature stays outside the timed operator.** HF runs it as a separate full-vocabulary
+  warper; including it would inflate the baseline with work a fused kernel absorbs for free.
+- **The baseline ladder is built and measured**: `hf_eager`, `ref_eager_fullsort`, `tight_eager`,
+  `compile`, `graph_eager`, `graph_compile`, `flashinfer`, `flashinfer_from_probs`.
+- **The performance anchor is `V=151936, k=50, p=0.90`** — `regime.ANCHOR_*`, the larger vocabulary
+  and so the conservative point for a latency claim. The tie-fidelity artifact was measured at
+  `V=128256` (`regime.FIDELITY_VOCAB`); every artifact records its own vocabulary.
+- **The bar for the kernel is `flashinfer_from_probs`, not `hf_eager`.**
+
+**Still open:**
+
 - Whether per-sequence `top_k` / `top_p` vectors ever enter scope — likely forced by Phase 2
-- Whether temperature scaling is fused in or stays a caller-side multiply (HF applies it first, as
-  a separate warper)
-- The baseline ladder rungs beyond HF eager (`torch.compile`, CUDA graphs, the tight eager
-  reference as a fusion-isolating rung, staged custom variants)
-- The anchor model whose `V` the headline sweep quotes
-- When Phase 2 begins, and which engine — this decides whether the Phase 1 headline survives
+- When Phase 2 begins, and whether the contract moves to FlashInfer or vLLM. FlashInfer is
+  measured as a rung today but is not the semantic contract; adopting it would change the top-p
+  definition, which is a semantics change and needs its own decision.

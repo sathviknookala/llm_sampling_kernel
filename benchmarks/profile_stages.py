@@ -8,6 +8,7 @@ from torch.profiler import ProfilerActivity, profile
 from transformers.generation.logits_process import TopKLogitsWarper, TopPLogitsWarper
 
 from . import harness
+from .regime import ANCHOR_TOP_K, ANCHOR_TOP_P, ANCHOR_VOCAB
 from .implementations import sample_tight
 from .hf_baseline import sample_hf
 
@@ -84,9 +85,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/raw/stage_profile.csv")
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 8, 32])
-    ap.add_argument("--vocab", type=int, default=151936)
-    ap.add_argument("--top-k", type=int, default=50)
-    ap.add_argument("--top-p", type=float, default=0.90)
+    ap.add_argument("--vocab", type=int, default=ANCHOR_VOCAB)
+    ap.add_argument("--top-k", type=int, default=ANCHOR_TOP_K)
+    ap.add_argument("--top-p", type=float, default=ANCHOR_TOP_P)
     args = ap.parse_args(argv)
 
     busy, apps = harness.gpu_is_busy()
