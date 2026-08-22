@@ -47,7 +47,11 @@ def sample_eager(
     k = min(top_k, logits.shape[-1])
     x = logits.to(COMPUTE_DTYPE)
 
-    topk_logits, topk_ids = torch.topk(x, k, dim=-1, sorted=True)
+    # stable descending sort, not topk: ties resolve to the lowest token id, identically on
+    # cpu and cuda, so the kernel has a portable exact target. torch.topk leaves tie order
+    # unspecified and cpu/cuda disagree, which is unusable as a gate where ties are the norm
+    order = torch.sort(x, dim=-1, descending=True, stable=True)
+    topk_logits, topk_ids = order.values[:, :k], order.indices[:, :k]
     probs = torch.softmax(topk_logits, dim=-1)
     cumsum = probs.cumsum(dim=-1)
 
