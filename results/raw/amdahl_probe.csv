@@ -1,0 +1,13 @@
+model,params,vocab,batch,prompt_len,dtype,decode_step_us,weight_read_floor_us,decode_vs_floor_ratio,sampler,sampling_us,sampling_pct_of_step,speedup_2x_gain_pct,speedup_5x_gain_pct,speedup_10x_gain_pct,speedup_inf_gain_pct,measured,git_commit
+Qwen/Qwen2-0.5B,494032768,151936,1,512,bfloat16,7271.94,1789.84,4.063,hf_eager,343.55,4.724,2.3622,3.7795,4.2519,4.7243,true,f2d1bf7-dirty
+Qwen/Qwen2-0.5B,494032768,151936,1,512,bfloat16,7271.94,1789.84,4.063,flashinfer,90.24,1.241,0.6205,0.9927,1.1168,1.2409,true,f2d1bf7-dirty
+Qwen/Qwen2-0.5B,494032768,151936,1,512,bfloat16,7271.94,1789.84,4.063,graph_eager,85.43,1.175,0.5874,0.9398,1.0573,1.1748,true,f2d1bf7-dirty
+Qwen/Qwen2-0.5B,494032768,151936,8,512,bfloat16,7610.50,1789.84,4.252,hf_eager,733.90,9.643,4.8217,7.7147,8.6790,9.6433,true,f2d1bf7-dirty
+Qwen/Qwen2-0.5B,494032768,151936,8,512,bfloat16,7610.50,1789.84,4.252,flashinfer,98.49,1.294,0.6471,1.0353,1.1648,1.2942,true,f2d1bf7-dirty
+Qwen/Qwen2-0.5B,494032768,151936,8,512,bfloat16,7610.50,1789.84,4.252,graph_eager,110.27,1.449,0.7244,1.1591,1.3040,1.4489,true,f2d1bf7-dirty
+mistralai/Mistral-7B-v0.1,7241732096,32000,1,512,bfloat16,28177.45,26236.21,1.074,hf_eager,242.53,0.861,0.4304,0.6886,0.7747,0.8607,true,f2d1bf7-dirty
+mistralai/Mistral-7B-v0.1,7241732096,32000,1,512,bfloat16,28177.45,26236.21,1.074,flashinfer,45.66,0.162,0.0810,0.1296,0.1458,0.1621,true,f2d1bf7-dirty
+mistralai/Mistral-7B-v0.1,7241732096,32000,1,512,bfloat16,28177.45,26236.21,1.074,graph_eager,70.62,0.251,0.1253,0.2005,0.2255,0.2506,true,f2d1bf7-dirty
+mistralai/Mistral-7B-v0.1,7241732096,32000,8,512,bfloat16,33133.90,26236.21,1.263,hf_eager,319.29,0.964,0.4818,0.7709,0.8673,0.9636,true,f2d1bf7-dirty
+mistralai/Mistral-7B-v0.1,7241732096,32000,8,512,bfloat16,33133.90,26236.21,1.263,flashinfer,51.83,0.156,0.0782,0.1251,0.1408,0.1564,true,f2d1bf7-dirty
+mistralai/Mistral-7B-v0.1,7241732096,32000,8,512,bfloat16,33133.90,26236.21,1.263,graph_eager,79.04,0.239,0.1193,0.1908,0.2147,0.2385,true,f2d1bf7-dirty

@@ -1,0 +1,25 @@
+impl,batch,vocab,top_k,top_p,dtype,kernels,note,git_commit
+hf_eager,1,151936,50,0.9,bfloat16,64,,f2d1bf7-dirty
+ref_eager_fullsort,1,151936,50,0.9,bfloat16,39,,f2d1bf7-dirty
+tight_eager,1,151936,50,0.9,bfloat16,43,,f2d1bf7-dirty
+flashinfer,1,151936,50,0.9,bfloat16,11,,f2d1bf7-dirty
+flashinfer_from_probs,1,151936,50,0.9,bfloat16,9,,f2d1bf7-dirty
+compile,1,151936,50,0.9,bfloat16,35,inductor-generated,f2d1bf7-dirty
+graph_eager,1,151936,50,0.9,bfloat16,45,device kernels unchanged; replay removes the host-side launches,f2d1bf7-dirty
+graph_compile,1,151936,50,0.9,bfloat16,37,device kernels unchanged; replay removes the host-side launches,f2d1bf7-dirty
+hf_eager,8,151936,50,0.9,bfloat16,70,,f2d1bf7-dirty
+ref_eager_fullsort,8,151936,50,0.9,bfloat16,46,,f2d1bf7-dirty
+tight_eager,8,151936,50,0.9,bfloat16,42,,f2d1bf7-dirty
+flashinfer,8,151936,50,0.9,bfloat16,11,,f2d1bf7-dirty
+flashinfer_from_probs,8,151936,50,0.9,bfloat16,9,,f2d1bf7-dirty
+compile,8,151936,50,0.9,bfloat16,35,inductor-generated,f2d1bf7-dirty
+graph_eager,8,151936,50,0.9,bfloat16,44,device kernels unchanged; replay removes the host-side launches,f2d1bf7-dirty
+graph_compile,8,151936,50,0.9,bfloat16,37,device kernels unchanged; replay removes the host-side launches,f2d1bf7-dirty
+hf_eager,32,151936,50,0.9,bfloat16,70,,f2d1bf7-dirty
+ref_eager_fullsort,32,151936,50,0.9,bfloat16,46,,f2d1bf7-dirty
+tight_eager,32,151936,50,0.9,bfloat16,42,,f2d1bf7-dirty
+flashinfer,32,151936,50,0.9,bfloat16,11,,f2d1bf7-dirty
+flashinfer_from_probs,32,151936,50,0.9,bfloat16,9,,f2d1bf7-dirty
+compile,32,151936,50,0.9,bfloat16,35,inductor-generated,f2d1bf7-dirty
+graph_eager,32,151936,50,0.9,bfloat16,44,device kernels unchanged; replay removes the host-side launches,f2d1bf7-dirty
+graph_compile,32,151936,50,0.9,bfloat16,37,device kernels unchanged; replay removes the host-side launches,f2d1bf7-dirty

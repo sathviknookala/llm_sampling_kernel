@@ -1,0 +1,20 @@
+{
+  "clocks_locked": false,
+  "clocks_max_sm_mhz": "3090 MHz",
+  "driver": "575.64.03",
+  "flashinfer_version": "0.6.17",
+  "git_commit": "f2d1bf7-dirty",
+  "gpu_busy_at_start": false,
+  "gpu_compute_apps_at_start": "none",
+  "gpu_l2_bytes": 50331648,
+  "gpu_name": "NVIDIA RTX PRO 4000 Blackwell",
+  "gpu_sm": "120",
+  "gpu_sm_count": 70,
+  "gpu_total_mem_bytes": 25151537152,
+  "measured_hbm_bandwidth_bytes_per_s": 552214083320.4376,
+  "persistence_mode": "Disabled",
+  "python": "3.12.13",
+  "torch_cuda": "12.8",
+  "torch_version": "2.9.1+cu128",
+  "transformers_version": "5.12.1"
+}
