@@ -1,4 +1,5 @@
 import json
+import os
 import platform
 import subprocess
 
@@ -80,6 +81,14 @@ def environment(clocks_locked):
         env["flashinfer_version"] = flashinfer.__version__
     except Exception:
         env["flashinfer_version"] = "absent"
+    try:
+        import fused_sampling
+
+        env["fused_kernel_so"] = fused_sampling.__file__
+        env["fused_kernel_mtime"] = int(os.path.getmtime(fused_sampling.__file__))
+    except Exception:
+        env["fused_kernel_so"] = "absent"
+        env["fused_kernel_mtime"] = 0
     return env
 
 

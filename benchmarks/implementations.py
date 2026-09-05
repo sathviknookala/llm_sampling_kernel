@@ -16,6 +16,13 @@ try:
 except Exception:
     HAVE_FLASHINFER = False
 
+try:
+    from .fused import sample_fused
+
+    HAVE_FUSED = True
+except Exception:
+    HAVE_FUSED = False
+
 
 def sample_tight(logits, top_k, top_p):
     x = logits.float()
@@ -57,6 +64,8 @@ EAGER_FNS = {
 if HAVE_FLASHINFER:
     EAGER_FNS["flashinfer"] = _flashinfer
     EAGER_FNS["flashinfer_from_probs"] = _flashinfer_from_probs
+if HAVE_FUSED:
+    EAGER_FNS["fused_kernel"] = sample_fused
 
 PROBS_INPUT_IMPLS = {"flashinfer_from_probs"}
 

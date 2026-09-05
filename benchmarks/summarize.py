@@ -7,6 +7,7 @@ from pathlib import Path
 LADDER_ORDER = [
     "hf_eager", "ref_eager_fullsort", "tight_eager", "compile",
     "graph_eager", "graph_compile", "flashinfer", "flashinfer_from_probs",
+    "fused_kernel",
 ]
 
 
