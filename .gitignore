@@ -4,3 +4,5 @@ __pycache__/
 *.so
 build/
 .pytest_cache/
+*.egg-info/
+dist/
