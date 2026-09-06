@@ -51,10 +51,6 @@ __device__ __forceinline__ uint64_t block_max_u64(uint64_t v, uint64_t* smem) {
   return smem[0];
 }
 
-}  // namespace fs
-
-namespace fs {
-
 // forward: positive -> b | 0x8000, negative -> ~b. both are involutions on their half.
 __device__ __forceinline__ uint16_t key_to_bits(uint32_t key) {
   return (key & 0x8000u) ? static_cast<uint16_t>(key & 0x7FFFu)
