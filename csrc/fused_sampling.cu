@@ -9,7 +9,7 @@
 namespace {
 
 constexpr int BLOCK = 512;
-constexpr int MERGE_BLOCK = 1024;
+constexpr int MERGE_BLOCK = 512;  // measured: 512 beats 1024 by ~7% at B=32 and ties at B=1; 128 is far worse
 constexpr int NSUB = 8;
 constexpr int TIE_CAP = 2048;
 constexpr int MERGE_CAP = 1024;
