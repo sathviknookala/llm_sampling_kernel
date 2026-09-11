@@ -255,3 +255,54 @@ def test_gate_a_cut_lands_exactly_on_the_boundary(top_p, expected_kept, dtype):
     _, keep, _ = fused_sampling.stages_fused(x, 8, top_p, 0, 0, 0)
     assert keep.sum(-1).tolist() == [expected_kept] * 4
     assert torch.equal(keep, stages(x, 8, top_p).keep)
+
+
+def _capture(x, top_k, top_p):
+    g = torch.cuda.CUDAGraph()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            fused.sample_fused(x, top_k, top_p)
+    torch.cuda.current_stream().wait_stream(s)
+    with torch.cuda.graph(g):
+        out = fused.sample_fused(x, top_k, top_p)
+    return g, out
+
+
+def test_graph_replay_advances_the_rng_stream():
+    # a host-side offset counter is baked into the graph at capture time, so every replay would
+    # return the identical token -- silently, and only in the deployment mode that matters
+    torch.manual_seed(0)
+    x = (torch.randn(8, 4000, device="cuda") * 2).to(torch.bfloat16)
+    g, out = _capture(x, 50, 0.95)
+    draws = []
+    for _ in range(16):
+        g.replay()
+        torch.cuda.synchronize()
+        draws.append(out.clone())
+    assert not all(torch.equal(draws[0], d) for d in draws), "graph replay froze the RNG stream"
+    assert len({tuple(d.tolist()) for d in draws}) > 8
+
+
+def test_graph_replay_still_samples_inside_the_nucleus():
+    torch.manual_seed(0)
+    x = (torch.randn(8, 4000, device="cuda") * 2).to(torch.bfloat16)
+    ref = stages(x, 50, 0.95)
+    g, out = _capture(x, 50, 0.95)
+    for _ in range(16):
+        g.replay()
+        torch.cuda.synchronize()
+        assert (rank_of(ref.topk_ids, out) < ref.cutoff).all()
+
+
+def test_an_explicit_offset_is_still_reproducible():
+    import fused_sampling
+
+    torch.manual_seed(0)
+    x = (torch.randn(8, 4000, device="cuda") * 2).to(torch.bfloat16)
+    a = fused_sampling.sample_fused(x, 50, 0.9, 1234, 7, 0)
+    b = fused_sampling.sample_fused(x, 50, 0.9, 1234, 7, 0)
+    c = fused_sampling.sample_fused(x, 50, 0.9, 1234, 8, 0)
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)

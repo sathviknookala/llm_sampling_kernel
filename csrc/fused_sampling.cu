@@ -1,3 +1,5 @@
+#include <ATen/cuda/CUDAGeneratorImpl.h>
+#include <ATen/cuda/detail/UnpackRaw.cuh>
 #include <algorithm>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
@@ -286,6 +288,7 @@ template <bool IS_BF16, int STOP>
 __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
                                     int64_t* __restrict__ out, int splits, int K, int P,
                                     float top_p, uint64_t seed, uint64_t offset,
+                                    at::PhiloxCudaState philox, bool from_gen,
                                     bool* __restrict__ keep_out, float* __restrict__ renormed_out) {
   __shared__ uint64_t buf[MERGE_CAP];
   __shared__ float w[K_CAP];
@@ -327,7 +330,14 @@ __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
       }
     }
     const float zp = cum[r];
-    const float u = fs::rng_uniform(seed, offset, static_cast<uint32_t>(b)) * zp;
+    uint64_t rs = seed, ro_ = offset;
+    if (from_gen) {
+      // capture-safe: under a graph this reads the pointers the replay updates, not baked values
+      const auto st = at::cuda::philox::unpack(philox);
+      rs = std::get<0>(st);
+      ro_ = std::get<1>(st);
+    }
+    const float u = fs::rng_uniform(rs, ro_, static_cast<uint32_t>(b)) * zp;
     int pick = r;
     for (int i = 0; i <= r; ++i) {
       if (cum[i] >= u) {
@@ -400,12 +410,24 @@ Plan make_plan(const torch::Tensor& logits, int64_t top_k, int64_t splits_overri
 
 #undef SUF
 
+// offset < 0 means "draw from torch's default CUDA generator", which is the only form that
+// survives cuda-graph capture -- a host-side counter is baked into the graph at capture time
+static at::PhiloxCudaState philox_state(bool from_gen) {
+  if (!from_gen) return at::PhiloxCudaState(0, 0);
+  auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+      c10::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+  std::lock_guard<std::mutex> lock(gen->mutex_);
+  return gen->philox_cuda_state(4);
+}
+
 torch::Tensor sample_fused(torch::Tensor logits, int64_t top_k, double top_p, int64_t seed,
                            int64_t offset, int64_t splits_override) {
   TORCH_CHECK(top_p > 0.0 && top_p <= 1.0, "top_p must be in (0, 1]");
   const Plan p = make_plan(logits, top_k, splits_override);
   const bool is_bf16 = logits.scalar_type() == at::kBFloat16;
 
+  const bool from_gen = offset < 0;
+  const at::PhiloxCudaState philox = philox_state(from_gen);
   auto out = torch::empty({p.batch}, logits.options().dtype(torch::kInt64));
   auto partial = torch::empty({p.batch, p.splits, p.K}, logits.options().dtype(torch::kInt64));
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -419,11 +441,13 @@ torch::Tensor sample_fused(torch::Tensor logits, int64_t top_k, double top_p, in
   if (is_bf16) {
     merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
         pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), nullptr, nullptr);
+        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset < 0 ? 0 : offset), philox,
+        from_gen, nullptr, nullptr);
   } else {
     merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
         pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), nullptr, nullptr);
+        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset < 0 ? 0 : offset), philox,
+        from_gen, nullptr, nullptr);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
@@ -479,11 +503,11 @@ torch::Tensor probe_phase(torch::Tensor logits, int64_t top_k, double top_p, int
   auto* o = out.data_ptr<int64_t>();
   const float tp = static_cast<float>(top_p);
   if (is_bf16) {
-    if (ms == 1) merge_sample_kernel<true, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, nullptr, nullptr);
-    else merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, nullptr, nullptr);
+    if (ms == 1) merge_sample_kernel<true, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, at::PhiloxCudaState(0, 0), false, nullptr, nullptr);
+    else merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, at::PhiloxCudaState(0, 0), false, nullptr, nullptr);
   } else {
-    if (ms == 1) merge_sample_kernel<false, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, nullptr, nullptr);
-    else merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, nullptr, nullptr);
+    if (ms == 1) merge_sample_kernel<false, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, at::PhiloxCudaState(0, 0), false, nullptr, nullptr);
+    else merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, at::PhiloxCudaState(0, 0), false, nullptr, nullptr);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
@@ -512,11 +536,13 @@ std::vector<torch::Tensor> stages_fused(torch::Tensor logits, int64_t top_k, dou
   if (is_bf16) {
     merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
         pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), kp, rp);
+        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), at::PhiloxCudaState(0, 0),
+        false, kp, rp);
   } else {
     merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
         pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), kp, rp);
+        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), at::PhiloxCudaState(0, 0),
+        false, kp, rp);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {out, keep, renormed};
