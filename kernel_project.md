@@ -194,58 +194,63 @@ A speedup against HF eager is not a result: `tight_eager`, ordinary eager PyTorc
 
 ## Current Focus
 
-**The spike is done and the kernel exists.** `csrc/fused_sampling.cu` runs the whole operation --
-`[B, V]` logits to one token id -- in **20.6 us at B=1**, against **74.0 us** for
-`flashinfer_from_probs` measured in the same process. Across the grid the win is **2.5x-4.3x**.
-272 tests + 2 skipped. **Read `results/SPIKE.md` before touching `csrc/`.**
+**The kernel is Gate A certified and beats the bar.** `csrc/fused_sampling.cu` runs the whole
+operation -- `[B, V]` logits to one token id -- in **22.5 us at B=1**, against **75.4 us** for
+`flashinfer_from_probs` measured in the same process (`results/raw/spike_ladder.csv`, 1134 rows).
+Across the grid the win is **2.28x-4.09x**. 319 tests + 2 skipped.
+**Read `results/SPIKE.md` before touching `csrc/`.**
 
-The honest qualifier: `DECISION.md` §6 projected 5-20x at low batch and this prototype does not
-reach it. The reason is measured, not guessed -- `results/raw/kernel_floor.csv` puts one full pass
-over the vocabulary at **4.56 us** (B=1) and the dispatch floor at **2.57 us**, so the kernel sits
-**4.5x above its own floor**. Quote 3.59x, not the projection.
+**It is deliberately slower than the first spike, and that is the headline to explain.** At commit
+`33802d7` it was 20.6 us / 3.59x. Closing Gate A cost ~9% at k=50 and ~19% at k=100: the cut now
+normalizes before taking the prefix exactly as `reference.py` does, which is K per-element
+divisions the old `cum[i-1] >= top_p * z` form never paid. Quote **3.35x**, and never the 3.59x
+still sitting in git history.
 
-**Where that gap goes is now measured, not inferred** (`results/raw/kernel_phases.csv`, 1215 rows;
-breakdown in `results/raw/kernel_phase_breakdown.csv`, `SPIKE.md` §2.1). At B=1, k=50: the merge
-kernel is **50%** of the 20.5 us and its bitonic sort alone is 40%; the three row passes are 37%;
-the two boundary searches are 0.5%, i.e. free. At B=32 it inverts -- traversals 66%, merge 26%.
-The earlier guess that split the gap evenly across passes, syncs and the merge was wrong.
+Gate status: **Gate A closed** -- `topk_ids` exact, ties exact at any multiplicity (no clamp),
+`keep` 0 mismatches over 195 840 elements across 54 configurations, `renormed` 15 ulp (cannot be
+bitwise; torch scans the prefix, the kernel sums it serially). **Gate B has still not been run.**
+
+Where the 22.5 us goes, measured not inferred (`results/raw/kernel_phase_breakdown.csv`): at B=1
+the merge kernel is 54% (bitonic sort 36%, sampling tail 18%), the three row passes 34%, the two
+boundary searches 0.9%. At B=32 it inverts -- traversals 63%, merge 29%.
 
 Next, in order:
 
-1. **Attack the merge kernel** -- half the cost at B=1 and it runs in one block there. Sort each
-   split's candidates in `topk_partial_kernel` (which has `splits x B` blocks) so the merge becomes
-   a bitonic merge of sorted runs, not a 45-stage full sort. Partials are gathered in arbitrary
-   atomic order today, so the sort has to be added, not just exploited
-2. Halve every bitonic stage -- `bitonic_ascending`'s `if (ixj > i)` idles half the threads in each
-   of 36-55 stages
-3. Replace the tie-buffer clamp with a radix pass on the index, then run **Gate A** elementwise
-   (`keep` / `renormed`, not just `topk_ids`)
-4. Collapse the three row passes into one register-resident warp select -- still worth 37% at B=1
-   and 66% at B=32, but no longer the first move
-5. Re-measure and decide whether §6's 5-20x is reachable or should be retired
+0. **Refit the split rule on `k`, not just `B`** -- `clamp(128/B, 4, 8)` is right at k=50/100 and
+   at B=32, and wrong at k=20: 20 splits gives 16.40 us at B=1 against the rule's 19.96 (+21.7%),
+   16 splits gives 18.56 at B=8 (+10.3%). `results/raw/kernel_splits.csv`. Cheapest win available
+1. **A barrier-free merge.** 0.18 us per bitonic stage is barrier and shared round-trip, not
+   arithmetic. One warp, registers, `__shfl_xor` with a cyclic layout: every `j >= 32` stage is
+   local, every `j < 32` stage is one shuffle, no `__syncthreads` at all
+2. **Run Gate B** -- the fp32 fidelity gate, the only gate still not run
+3. Collapse the three row passes into one register-resident warp select -- 34% at B=1, 63% at B=32
+4. Re-measure and decide whether `DECISION.md` §6's 5-20x is reachable or should be retired
+
+**Do not re-attempt these three** -- implemented, measured, reverted, written up in `SPIKE.md` §7:
+pair-indexing the bitonic stages (neutral); sorted runs per split with the merge resuming at `2R`
+(stages relocate, total flat); a K-conditional normalization path (built on 3-round noise).
 
 ## Last Session
 
-**Session 8 -- B0 of the roadmap: the phase attribution is now measured.** `ncu` is blocked here,
-so `csrc/fused_sampling.cu` is templated on a `STOP` phase: the kernel runs phases 1..n of itself
-and returns, and each phase costs a difference of two timings on the ladder's own instrument.
+**Session 9 -- Gate A closed, and two bugs that only existed off the measured path.** Six commits.
 
-- **The headline finding reversed the roadmap.** The merge kernel, not the row passes, is half the
-  cost at B=1. Confirmed by mechanism rather than correlation: merge cost tracks the bitonic
-  *stage* count across k -- 6.29/8.23/13.02 us for 36/45/55 stages, ~0.18 us per stage
-- **The probe design had to be fixed before it measured anything.** `-Xptxas -v` showed the
-  truncated instantiations were 8192 bytes lighter in shared memory -- the compiler drops `tie[]`
-  when no reachable code touches it -- so the ablation would have compared occupancies. The shared
-  arrays are now one allocation, identical across every instantiation
-- **A timed run was contaminated and thrown away.** Ran pytest on the GPU while the sweep was
-  measuring. Killed it, reordered so every GPU-touching step finishes before the sweep launches,
-  re-ran clean. The `full` control agrees with phase 7 to 0.04-0.39%
-- **A ~2.05 us quantum at B<=8 is real and unexplained.** Cumulative phase times land on near-exact
-  integer multiples of it, so sub-2 us phase boundaries are not resolvable at low batch -- only
-  their groups are. Within-round rep spread is 0.0-0.1%, so it is not rep noise. Documented in
-  `SPIKE.md` §2.1 rather than explained away
-- Six review agents added under `.claude/agents/`, and `kernel_project.md` refreshed as a tracked
-  mirror of this file (which is gitignored)
+- **The tie clamp is gone.** `TIE_CAP` silently emitted an arbitrary tied id past 2048 per split.
+  The fallback buckets the index, then uses a bitmap over the boundary bucket whose capacity is a
+  *proof* -- the bucket is `2^shift` wide. It runs only when the buffer would clamp, which real
+  logits never reach (max multiplicity 14 in `tie_fidelity.csv`), so it costs nothing
+- **Graph capture froze the RNG.** The offset came from a host `itertools.count()`, so five
+  replays of a captured `sample_fused` returned `[1459, 2865, 3518, 2598]` every time. Invisible
+  to the whole eager ladder, wrong in exactly the deployment mode the project targets. Now
+  `PhiloxCudaState`, as dropout does it
+- **Gate A cost 9-19% and it was worth paying.** `a/z < p` is not `a < p*z` in fp32, so matching
+  `reference.py` meant K per-element divides. Visible directly in the ablation -- phase 7 went
+  2.06 -> 4.09 us
+- **Three optimizations measured as non-results and were reverted.** The instructive one: sorted
+  runs per split cut merge stages 18-52% and moved total time not at all -- on a latency-bound
+  dependent chain the stages relocate rather than disappear
+- **Three rounds is not enough to tune at B=1.** A K-conditional path was built on a 3-round
+  reading that 9 rounds reversed. The ~2.05 us quantum is larger than most of what is being
+  compared there
 
 ## Known Issues
 
@@ -265,15 +270,13 @@ and returns, and each phase costs a difference of two timings on the ladder's ow
 - **The remote repo name differs from the local directory** — `llm_sampling_kernel` vs
   `fused_sampling_kernel`. Intentional as far as this repo knows; noted so a future session does
   not read it as a wrong remote.
-- **The bar is beaten but the kernel is not certified.** `results/raw/spike_ladder.csv` (1134
-  rows). Quote against `flashinfer_from_probs`, never `hf_eager`. **Gate A and Gate B have not been
-  run on the kernel** — selection is exact and the distribution is verified, but `keep`/`renormed`
-  are not asserted elementwise.
-- **The kernel's tie handling has a documented clamp.** Ties are collected into a per-split shared
-  buffer of 2048. Past that, the retained *values* are still right but which tied id is emitted can
-  differ from the reference. Needs >2048 tokens sharing the exact k-th value inside one slice;
-  pinned by `test_tie_buffer_capacity_is_the_documented_spike_limit`. Gate A work must replace it
-  with a radix pass on the index.
+- **Gate A is closed; Gate B is not.** `results/raw/spike_ladder.csv` (1134 rows). Quote against
+  `flashinfer_from_probs`, never `hf_eager`. `topk_ids`, ties and `keep` are exact; `renormed` is
+  15 ulp and cannot be bitwise. **Gate B -- the fp32 fidelity gate -- has still not been run.**
+- **Ties are exact at any multiplicity; the clamp is gone.** Past 2048 per split the kernel falls
+  back to index bucketing plus a bitmap over the boundary bucket, which cannot overflow because
+  the bucket is `2^shift` wide. Real logits never reach it (max multiplicity 14 in
+  `results/raw/tie_fidelity.csv`), so the fast path is unchanged.
 - **A device-side assert in `torch.multinomial` is process-fatal on CUDA.** Feeding NaN/inf with
   `check_inputs=False` poisons the CUDA context for the whole process — every later CUDA op fails,
   not just the offending call (verified 2026-08-22). A long sweep with validation off for timing
