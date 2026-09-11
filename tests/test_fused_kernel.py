@@ -129,14 +129,26 @@ def test_rejects_shapes_and_dtypes_outside_the_regime():
         fused.sample_fused(x.t().contiguous().t(), 50, 0.9)
 
 
-def test_tie_buffer_capacity_is_the_documented_spike_limit():
-    # ties beyond TIE_CAP per split keep the right *values* but may emit a different tied id.
-    # one split over a 152K all-equal row is far past the cap; the retained value is still right.
-    x = torch.zeros(1, 151936, device="cuda", dtype=torch.bfloat16)
-    ids = fused.topk_fused(x, 50, splits=1)
-    assert ids.shape == (1, 50)
-    assert ids.unique().numel() == 50
-    assert (x[0, ids[0]] == 0).all(), "retained values must still be the top-k values"
+@pytest.mark.parametrize("vocab,splits", [(151936, 1), (151936, 8), (20000, 4), (5000, 1)])
+def test_ties_past_the_buffer_are_still_resolved_exactly(vocab, splits):
+    # every element ties, so one slice holds vocab/splits of them -- far past TIE_CAP, which used
+    # to clamp and emit an arbitrary tied id. the index-bucket fallback makes it exact instead.
+    x = torch.zeros(2, vocab, device="cuda", dtype=torch.bfloat16)
+    assert (vocab + splits - 1) // splits > 2048, "this case must actually overflow the buffer"
+    for top_k in (1, 50, 100):
+        ids = fused.topk_fused(x, top_k, splits=splits)
+        expected = torch.arange(top_k, device="cuda").expand(2, top_k)
+        assert torch.equal(ids, expected)
+
+
+@pytest.mark.parametrize("vocab", [20000, 151936])
+def test_dense_tie_rows_match_the_reference_with_one_split(vocab):
+    # a narrow logit range makes bf16 collapse many values onto the boundary key, driving the
+    # tie set past the buffer on realistic-shaped (not all-equal) input
+    torch.manual_seed(0)
+    x = (torch.randn(8, vocab, device="cuda") * 0.05).to(torch.bfloat16)
+    for top_k in (20, 50, 100):
+        assert torch.equal(fused.topk_fused(x, top_k, splits=1), stages(x, top_k, 0.9).topk_ids)
 
 
 def test_committed_floor_artifact_brackets_the_kernel():

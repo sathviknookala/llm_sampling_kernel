@@ -35,13 +35,94 @@ __device__ __forceinline__ void foreach_key(const uint16_t* __restrict__ row, in
   for (int i = elo + threadIdx.x; i < ehi; i += blockDim.x) f(i, fs::mono_key(row[i]));
 }
 
+// exact resolution of a k-boundary tie set too large to buffer. bucket the index into <=256 bins
+// of 2^shift, find the bin holding the need-th smallest, take every tie below it whole, and order
+// only within that bin -- via a bitmap that cannot overflow, since the bin is 2^shift wide.
+// order inside cand does not matter: the merge sorts every candidate anyway.
+template <typename F>
+__device__ __forceinline__ void exact_ties(F foreach, uint32_t* hist, uint32_t* suf, uint32_t* bm,
+                                           uint64_t* cand, uint32_t T, int shift, int n_gt,
+                                           int need, int* s_bb, int* s_below, int* s_cnt) {
+  const int t = threadIdx.x;
+  const int sub = (t >> 6) & (NSUB - 1);
+  for (int i = t; i < NSUB * 256; i += BLOCK) hist[i] = 0u;
+  __syncthreads();
+  foreach([&](int i, uint32_t k) {
+    if (k == T) atomicAdd(&hist[sub * 256 + (i >> shift)], 1u);
+  });
+  __syncthreads();
+  {
+    uint32_t v = 0;
+    if (t < 256) {
+#pragma unroll
+      for (int q = 0; q < NSUB; ++q) v += hist[q * 256 + t];
+    }
+    __syncthreads();
+    if (t < 256) hist[t] = v;
+  }
+  __syncthreads();
+
+  fs::suffix_sum_256(hist, suf);
+  // ascending prefix from the descending scan: pre[b] = total - sum_{j>b}
+  const uint32_t total = SUF(0);
+  if (t < 256) {
+    const uint32_t pre = total - ((t == 255) ? 0u : SUF(t + 1));
+    const uint32_t prev = total - SUF(t);
+    if (pre >= static_cast<uint32_t>(need) && prev < static_cast<uint32_t>(need)) {
+      *s_bb = t;
+      *s_below = static_cast<int>(prev);
+    }
+  }
+  const int nwords = (1 << shift) >> 5;
+  for (int i = t; i < nwords; i += BLOCK) bm[i] = 0u;
+  if (t == 0) *s_cnt = 0;
+  __syncthreads();
+
+  const int bb = *s_bb, n_below = *s_below, base = bb << shift;
+  foreach([&](int i, uint32_t k) {
+    if (k != T) return;
+    const int b = i >> shift;
+    if (b < bb) {
+      cand[n_gt + atomicAdd(s_cnt, 1)] = fs::pack(T, i);
+    } else if (b == bb) {
+      atomicOr(&bm[(i - base) >> 5], 1u << ((i - base) & 31));
+    }
+  });
+  __syncthreads();
+
+  if (t < 32) {
+    const int lane = t;
+    const int want = need - n_below;
+    int written = 0;
+    for (int w0 = 0; w0 < nwords && written < want; w0 += 32) {
+      uint32_t word = (w0 + lane < nwords) ? bm[w0 + lane] : 0u;
+      const int c = __popc(word);
+      int incl = c;
+#pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const int o = __shfl_up_sync(0xFFFFFFFFu, incl, off);
+        if (lane >= off) incl += o;
+      }
+      int slot = written + incl - c;
+      while (word) {
+        const int b = __ffs(word) - 1;
+        word &= word - 1;
+        if (slot < want) cand[n_gt + n_below + slot] = fs::pack(T, base + (w0 + lane) * 32 + b);
+        ++slot;
+      }
+      written += __shfl_sync(0xFFFFFFFFu, incl, 31);
+    }
+  }
+  __syncthreads();
+}
+
 // exact top-K of one slice of one row, by packed (key desc, index asc).
 // two 8-bit radix passes resolve the 16-bit key; the k-boundary tie then resolves on index.
 // STOP runs phases 1..STOP and sinks live state to `out`, so a phase costs a difference of two
 // measured timings rather than an inference -- ncu is blocked on this box. PARTIAL_ALL is production.
 template <int STOP>
 __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __restrict__ partial,
-                                    int vocab, int n_vec_total, int splits, int K) {
+                                    int vocab, int n_vec_total, int splits, int K, int shift) {
   // one allocation, so every STOP instantiation reserves the same shared memory -- otherwise the
   // compiler drops the arrays a truncated phase never reaches and the ablation compares occupancies
   constexpr int HIST_W = NSUB * 256;
@@ -50,7 +131,7 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
   uint32_t* suf = hist + HIST_W;
   uint32_t* tie = suf + 256;
   uint64_t* cand = reinterpret_cast<uint64_t*>(tie + TIE_CAP);
-  __shared__ int s_hb, s_lb, s_n_above, s_n_gt, s_n_out, s_n_tie;
+  __shared__ int s_hb, s_lb, s_n_above, s_n_gt, s_n_out, s_n_tie, s_bb, s_below, s_cnt;
 
   const int t = threadIdx.x;
   const int s = blockIdx.x;
@@ -172,14 +253,21 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
   __syncthreads();
 
   if (need > 0) {
-    const int n_tie = min(s_n_tie, TIE_CAP);
-    int p2 = 1;
-    while (p2 < n_tie) p2 <<= 1;
-    for (int i = t + n_tie; i < p2; i += BLOCK) tie[i] = 0xFFFFFFFFu;
-    __syncthreads();
-    if (p2 > 1) fs::bitonic_ascending<uint32_t>(tie, p2);
-    for (int i = t; i < need; i += BLOCK) cand[n_gt + i] = fs::pack(T, tie[i]);
-    __syncthreads();
+    if (s_n_tie <= TIE_CAP) {
+      const int n_tie = s_n_tie;
+      int p2 = 1;
+      while (p2 < n_tie) p2 <<= 1;
+      for (int i = t + n_tie; i < p2; i += BLOCK) tie[i] = 0xFFFFFFFFu;
+      __syncthreads();
+      if (p2 > 1) fs::bitonic_ascending<uint32_t>(tie, p2);
+      for (int i = t; i < need; i += BLOCK) cand[n_gt + i] = fs::pack(T, tie[i]);
+      __syncthreads();
+    } else {
+      // never seen on real logits (max tie multiplicity 14 in results/raw/tie_fidelity.csv), so
+      // the two extra traversals cost nothing in practice and the answer is exact regardless
+      auto foreach = [&](auto f) { foreach_key(row, vlo, vhi, elo, ehi, f); };
+      exact_ties(foreach, hist, suf, tie, cand, T, shift, n_gt, need, &s_bb, &s_below, &s_cnt);
+    }
   }
 
   for (int i = t; i < K; i += BLOCK) out[i] = (i < keff) ? cand[i] : 0ull;
@@ -261,7 +349,7 @@ int next_pow2(int n) {
 }
 
 struct Plan {
-  int batch, vocab, K, n_vec, splits, P;
+  int batch, vocab, K, n_vec, splits, P, shift;
 };
 
 Plan make_plan(const torch::Tensor& logits, int64_t top_k, int64_t splits_override) {
@@ -280,6 +368,10 @@ Plan make_plan(const torch::Tensor& logits, int64_t top_k, int64_t splits_overri
   p.n_vec = aligned ? p.vocab / 8 : 0;
   // splits are bounded by the merge buffer and by how many blocks the batch already provides;
   // the second bound comes from results/raw/kernel_floor.csv
+  // 2^shift-wide index buckets, at most 256 of them; the exact-tie bitmap is then 2^shift bits
+  p.shift = 0;
+  while ((p.vocab + (1 << p.shift) - 1) >> p.shift > 256) ++p.shift;
+  TORCH_CHECK((1 << p.shift) <= TIE_CAP * 32, "vocabulary too large for the exact-tie bitmap");
   const int units = p.n_vec > 0 ? p.n_vec : p.vocab;
   // measured: results/raw/kernel_splits.csv. the kernel is latency-bound on its phase chain,
   // not throughput-bound, so more blocks stops paying well before the SMs are full
@@ -306,7 +398,7 @@ torch::Tensor sample_fused(torch::Tensor logits, int64_t top_k, double top_p, in
 
   topk_partial_kernel<PARTIAL_ALL><<<dim3(p.splits, p.batch), BLOCK, 0, stream>>>(
       reinterpret_cast<const uint16_t*>(logits.data_ptr()),
-      reinterpret_cast<uint64_t*>(partial.data_ptr()), p.vocab, p.n_vec, p.splits, p.K);
+      reinterpret_cast<uint64_t*>(partial.data_ptr()), p.vocab, p.n_vec, p.splits, p.K, p.shift);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   const auto* pp = reinterpret_cast<const uint64_t*>(partial.data_ptr());
@@ -332,7 +424,7 @@ torch::Tensor topk_fused(torch::Tensor logits, int64_t top_k, int64_t splits_ove
 
   topk_partial_kernel<PARTIAL_ALL><<<dim3(p.splits, p.batch), BLOCK, 0, stream>>>(
       reinterpret_cast<const uint16_t*>(logits.data_ptr()),
-      reinterpret_cast<uint64_t*>(partial.data_ptr()), p.vocab, p.n_vec, p.splits, p.K);
+      reinterpret_cast<uint64_t*>(partial.data_ptr()), p.vocab, p.n_vec, p.splits, p.K, p.shift);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   merge_ids_kernel<<<p.batch, MERGE_BLOCK, 0, stream>>>(
       reinterpret_cast<const uint64_t*>(partial.data_ptr()), ids.data_ptr<int64_t>(), p.splits,
@@ -359,11 +451,11 @@ torch::Tensor probe_phase(torch::Tensor logits, int64_t top_k, double top_p, int
   const dim3 grid(p.splits, p.batch);
 
   switch (phase) {
-    case 1: topk_partial_kernel<1><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
-    case 2: topk_partial_kernel<2><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
-    case 3: topk_partial_kernel<3><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
-    case 4: topk_partial_kernel<4><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
-    default: topk_partial_kernel<PARTIAL_ALL><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
+    case 1: topk_partial_kernel<1><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K, p.shift); break;
+    case 2: topk_partial_kernel<2><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K, p.shift); break;
+    case 3: topk_partial_kernel<3><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K, p.shift); break;
+    case 4: topk_partial_kernel<4><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K, p.shift); break;
+    default: topk_partial_kernel<PARTIAL_ALL><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K, p.shift); break;
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   if (phase <= PARTIAL_ALL) return out;
