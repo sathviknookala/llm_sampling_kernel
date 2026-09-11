@@ -59,17 +59,56 @@ kernel can reach in this rig at `V=151936, bf16, hot`:
 | `torch_argmax` — for calibration | 8.40 | 10.30 | 16.55 | |
 
 So one full pass over the vocabulary costs **4.56 µs** at B=1 and the prototype costs 20.6 µs — it
-is **4.5× above its own floor**, and that is where the missing speedup is. Three things account for
-it, all structural rather than mysterious:
-
-- **Three passes over the row.** Two 8-bit radix passes resolve the 16-bit key, a third gathers the
-  candidates. A one-pass register-resident select (WarpSelect-style) would remove two of them.
-- **~50 block-wide syncs in the selection kernel** plus a 55-stage bitonic merge. Replacing the
-  merge's full sort with the same radix-select machinery would cut most of that.
-- **Two launches** (~2.6 µs each), because the split shape needs a merge step.
+is **4.5× above its own floor**, and that is where the missing speedup is.
 
 The floor probe also settled a question that mattered more than expected: at B=1 the rig's dispatch
 floor is 2.57 µs, not tens of microseconds. **The 74 µs bar is real device work, not instrument.**
+
+### 2.1 Where the 20.5 µs actually goes — measured, superseding an earlier guess
+
+An earlier revision of this section attributed the gap to three row passes, ~50 block syncs and the
+bitonic merge, in roughly equal parts. **That was inference and it was wrong about the balance.**
+`results/raw/kernel_phases.csv` (1215 rows, 9 rounds) runs phases 1..n of the real kernel and
+stops, so each phase is a difference of two timings on the ladder's own instrument — the only
+attribution available with `ncu` blocked. `results/raw/kernel_phase_breakdown.csv` holds the
+derived table. At `V=151936, k=50, bf16, hot`:
+
+| phase | B=1 | B=32 | |
+|---|---|---|---|
+| dispatch floor (`noop`) | 2.52 (12%) | 2.53 (8%) | launch + allocate |
+| 1 high-byte histogram | 1.63 (8%) | 5.67 (17%) | traversal |
+| 2 fold, suffix scan, bucket search | 0.02 (0%) | 0.01 (0%) | |
+| 3 low-byte histogram | 2.01 (10%) | 8.17 (25%) | traversal |
+| 4 fold, suffix scan, exact threshold | 0.08 (0%) | 0.00 (0%) | |
+| 5 gather, tie resolve, store | 3.99 (19%) | 7.85 (24%) | traversal |
+| 6 merge bitonic sort | **8.23 (40%)** | 5.85 (18%) | second launch |
+| 7 softmax, cumsum, cut, draw | 2.06 (10%) | 2.70 (8%) | |
+| **total** | **20.54** | **32.77** | |
+
+Three things this changes:
+
+- **At low batch the merge kernel is half the cost** — 10.29 µs of 20.54, and the bitonic sort
+  alone is 40%. It launches `<<<B, 1024>>>`, so at B=1 it is one block on a 70-SM GPU. The row
+  passes, the thing the roadmap was going to attack first, are 37%.
+- **The mechanism is confirmed, not assumed.** Merge cost tracks the bitonic *stage count* across
+  `k`: 6.29 / 8.23 / 13.02 µs for 36 / 45 / 55 stages at `k=20/50/100`, i.e. 0.175 / 0.183 / 0.237
+  µs per stage. A sort whose cost is linear in its stage count is a sort, not a memory effect.
+- **The two boundary searches are free** — 0.10 µs combined at B=1. The warp `suffix_sum_256` that
+  collapsed 16 block syncs into 1 already took that phase off the table; there is nothing left
+  there to win.
+
+At B=32 the balance inverts: the three traversals are 21.7 µs (66%) and the merge is 8.6 µs (26%),
+because the merge finally has 32 blocks to spread across.
+
+**Resolution caveat.** Clocks cannot be locked on this machine. Within a round the rep spread is
+0.0–0.1%, but at B≤8 the *cumulative* phase timings land on near-exact multiples of ~2.05 µs
+(2, 2, 3, 3, 5, 9, 10 × 2.053 at B=1), so a ~2 µs quantum migrates between adjacent phases from
+round to round. Individual sub-2 µs phase deltas at B≤8 are therefore not resolvable; their groups
+are — phases 3–5 together cost 6.08 / 6.04 / 6.03 µs at B=1/4/8, stable to 0.8%. The quantum is
+reproducible across 9 rounds and is **unexplained**; it does not affect the merge and traversal
+numbers above, which are far larger than it. The `full` control column (`sample_fused` timed
+alongside phase 7) agrees with phase 7 to within 0.04–0.39%, so the ablation is measuring the
+production path and not a divergent copy — `tests/test_fused_kernel.py` pins that equality.
 
 ## 3. Why the kernel is latency-bound, not bandwidth-bound
 
@@ -158,10 +197,18 @@ passed in and no extra launch is paid.
 
 ## 7. Next
 
-1. Replace the tie clamp with a radix pass on the index, then run Gate A elementwise.
-2. Collapse three row passes into one (register-resident warp select) and the bitonic merge into a
-   radix select — the floor says ~4× remains.
-3. Re-measure and decide whether §6's 5–20× is reachable or should be retired.
+Reordered by §2.1, which moved the merge kernel ahead of the row passes at low batch:
+
+1. **Attack the merge kernel** — 50% of the cost at B=1, and it runs in one block there. Sort each
+   split's candidates inside `topk_partial_kernel`, which already has `splits × B` blocks, so the
+   merge becomes a bitonic *merge* of sorted runs rather than a full 45-stage sort. Partials are
+   currently gathered in arbitrary atomic order, so this needs the sort added, not just exploited.
+2. **Halve every bitonic stage** — `bitonic_ascending` guards with `if (ixj > i)`, so half the
+   threads idle in each of the 36–55 stages. Indexing only the lower half removes that.
+3. Replace the tie clamp with a radix pass on the index, then run Gate A elementwise.
+4. Collapse the three row passes into one register-resident warp select — worth 37% at B=1 and 66%
+   at B=32, but the harder change, and §2.1 says it is no longer the first one.
+5. Re-measure and decide whether `DECISION.md` §6's 5–20× is reachable or should be retired.
 
 ## Reproduction
 
@@ -171,6 +218,7 @@ V=~/.venv_flashinfer/bin/python
 $V setup.py build_ext --inplace
 $V -m pytest tests/ -q
 $V -m benchmarks.kernel_floor                       # kernel_floor.csv + kernel_splits.csv
+$V -m benchmarks.kernel_phases --rounds 9           # kernel_phases.csv + kernel_phase_breakdown.csv
 $V -m benchmarks.benchmark_sampling --rounds 3 --reps 5 \
     --out results/raw/spike_ladder.csv --env-out results/raw/environment_spike.json
 $V -m benchmarks.summarize --raw results/raw/spike_ladder.csv --out results/summary_spike.md

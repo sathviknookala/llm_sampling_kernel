@@ -14,6 +14,9 @@ constexpr int NSUB = 8;
 constexpr int TIE_CAP = 2048;
 constexpr int MERGE_CAP = 1024;
 constexpr int K_CAP = 128;
+// the last phase of each kernel; the ablation probes instantiate the lower values
+constexpr int PARTIAL_ALL = 5;
+constexpr int MERGE_ALL = 2;
 
 #define SUF(b) suf[255 - (b)]
 
@@ -34,12 +37,19 @@ __device__ __forceinline__ void foreach_key(const uint16_t* __restrict__ row, in
 
 // exact top-K of one slice of one row, by packed (key desc, index asc).
 // two 8-bit radix passes resolve the 16-bit key; the k-boundary tie then resolves on index.
+// STOP runs phases 1..STOP and sinks live state to `out`, so a phase costs a difference of two
+// measured timings rather than an inference -- ncu is blocked on this box. PARTIAL_ALL is production.
+template <int STOP>
 __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __restrict__ partial,
                                     int vocab, int n_vec_total, int splits, int K) {
-  __shared__ uint32_t hist[NSUB][256];
-  __shared__ uint32_t suf[256];
-  __shared__ uint32_t tie[TIE_CAP];
-  __shared__ uint64_t cand[K_CAP];
+  // one allocation, so every STOP instantiation reserves the same shared memory -- otherwise the
+  // compiler drops the arrays a truncated phase never reaches and the ablation compares occupancies
+  constexpr int HIST_W = NSUB * 256;
+  __shared__ __align__(16) uint32_t smem[HIST_W + 256 + TIE_CAP + K_CAP * 2];
+  uint32_t* hist = smem;
+  uint32_t* suf = hist + HIST_W;
+  uint32_t* tie = suf + 256;
+  uint64_t* cand = reinterpret_cast<uint64_t*>(tie + TIE_CAP);
   __shared__ int s_hb, s_lb, s_n_above, s_n_gt, s_n_out, s_n_tie;
 
   const int t = threadIdx.x;
@@ -69,23 +79,27 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
   }
   const int keff = min(K, count);
 
-  for (int i = t; i < NSUB * 256; i += BLOCK) reinterpret_cast<uint32_t*>(hist)[i] = 0u;
+  for (int i = t; i < HIST_W; i += BLOCK) hist[i] = 0u;
   __syncthreads();
   foreach_key(row, vlo, vhi, elo, ehi,
-              [&](int, uint32_t k) { atomicAdd(&hist[sub][k >> 8], 1u); });
+              [&](int, uint32_t k) { atomicAdd(&hist[sub * 256 + (k >> 8)], 1u); });
   __syncthreads();
+  if constexpr (STOP == 1) {
+    for (int i = t; i < K; i += BLOCK) out[i] = hist[(i & (NSUB - 1)) * 256 + i];
+    return;
+  }
   {
     uint32_t v = 0;
     if (t < 256) {
 #pragma unroll
-      for (int q = 0; q < NSUB; ++q) v += hist[q][t];
+      for (int q = 0; q < NSUB; ++q) v += hist[q * 256 + t];
     }
     __syncthreads();
-    if (t < 256) hist[0][t] = v;
+    if (t < 256) hist[t] = v;
   }
   __syncthreads();
 
-  fs::suffix_sum_256(&hist[0][0], suf);
+  fs::suffix_sum_256(hist, suf);
   if (t < 256 && SUF(t) >= static_cast<uint32_t>(keff) &&
       (t == 255 || SUF(t + 1) < static_cast<uint32_t>(keff))) {
     s_hb = t;
@@ -94,25 +108,35 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
   __syncthreads();
   const int hb = s_hb;
   const int n_above = s_n_above;
+  if constexpr (STOP == 2) {
+    for (int i = t; i < K; i += BLOCK)
+      out[i] = (i == 0) ? static_cast<uint64_t>(hb)
+                        : (i == 1 ? static_cast<uint64_t>(n_above) : 0ull);
+    return;
+  }
 
-  for (int i = t; i < NSUB * 256; i += BLOCK) reinterpret_cast<uint32_t*>(hist)[i] = 0u;
+  for (int i = t; i < HIST_W; i += BLOCK) hist[i] = 0u;
   __syncthreads();
   foreach_key(row, vlo, vhi, elo, ehi, [&](int, uint32_t k) {
-    if (static_cast<int>(k >> 8) == hb) atomicAdd(&hist[sub][k & 0xFFu], 1u);
+    if (static_cast<int>(k >> 8) == hb) atomicAdd(&hist[sub * 256 + (k & 0xFFu)], 1u);
   });
   __syncthreads();
+  if constexpr (STOP == 3) {
+    for (int i = t; i < K; i += BLOCK) out[i] = hist[(i & (NSUB - 1)) * 256 + i];
+    return;
+  }
   {
     uint32_t v = 0;
     if (t < 256) {
 #pragma unroll
-      for (int q = 0; q < NSUB; ++q) v += hist[q][t];
+      for (int q = 0; q < NSUB; ++q) v += hist[q * 256 + t];
     }
     __syncthreads();
-    if (t < 256) hist[0][t] = v;
+    if (t < 256) hist[t] = v;
   }
   __syncthreads();
 
-  fs::suffix_sum_256(&hist[0][0], suf);
+  fs::suffix_sum_256(hist, suf);
   const int want = keff - n_above;
   if (t < 256 && SUF(t) >= static_cast<uint32_t>(want) &&
       (t == 255 || SUF(t + 1) < static_cast<uint32_t>(want))) {
@@ -128,6 +152,11 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
   const uint32_t T = (static_cast<uint32_t>(hb) << 8) | static_cast<uint32_t>(s_lb);
   const int n_gt = s_n_gt;
   const int need = keff - n_gt;
+  if constexpr (STOP == 4) {
+    for (int i = t; i < K; i += BLOCK)
+      out[i] = (i == 0) ? static_cast<uint64_t>(T) : (i == 1 ? static_cast<uint64_t>(n_gt) : 0ull);
+    return;
+  }
 
   foreach_key(row, vlo, vhi, elo, ehi, [&](int i, uint32_t k) {
     if (k > T) {
@@ -163,7 +192,7 @@ __device__ __forceinline__ void merge_sort_shared(const uint64_t* __restrict__ s
   if (P > 1) fs::bitonic_ascending<uint64_t>(buf, P);
 }
 
-template <bool IS_BF16>
+template <bool IS_BF16, int STOP>
 __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
                                     int64_t* __restrict__ out, int splits, int K, int P,
                                     float top_p, uint64_t seed, uint64_t offset) {
@@ -174,6 +203,10 @@ __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
   const int t = threadIdx.x;
   const int b = blockIdx.x;
   merge_sort_shared(partial + static_cast<size_t>(b) * splits * K, buf, splits * K, P);
+  if constexpr (STOP == 1) {
+    if (t == 0) out[b] = static_cast<int64_t>(fs::unpack_idx(buf[P - 1]));
+    return;
+  }
 
   // ascending sort, so rank r of the descending top-K sits at P-1-r
   const float m = fs::key_to_float<IS_BF16>(fs::unpack_key(buf[P - 1]));
@@ -271,18 +304,18 @@ torch::Tensor sample_fused(torch::Tensor logits, int64_t top_k, double top_p, in
   auto partial = torch::empty({p.batch, p.splits, p.K}, logits.options().dtype(torch::kInt64));
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  topk_partial_kernel<<<dim3(p.splits, p.batch), BLOCK, 0, stream>>>(
+  topk_partial_kernel<PARTIAL_ALL><<<dim3(p.splits, p.batch), BLOCK, 0, stream>>>(
       reinterpret_cast<const uint16_t*>(logits.data_ptr()),
       reinterpret_cast<uint64_t*>(partial.data_ptr()), p.vocab, p.n_vec, p.splits, p.K);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   const auto* pp = reinterpret_cast<const uint64_t*>(partial.data_ptr());
   if (is_bf16) {
-    merge_sample_kernel<true><<<p.batch, MERGE_BLOCK, 0, stream>>>(
+    merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
         pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
         static_cast<uint64_t>(seed), static_cast<uint64_t>(offset));
   } else {
-    merge_sample_kernel<false><<<p.batch, MERGE_BLOCK, 0, stream>>>(
+    merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
         pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
         static_cast<uint64_t>(seed), static_cast<uint64_t>(offset));
   }
@@ -297,7 +330,7 @@ torch::Tensor topk_fused(torch::Tensor logits, int64_t top_k, int64_t splits_ove
   auto partial = torch::empty({p.batch, p.splits, p.K}, logits.options().dtype(torch::kInt64));
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  topk_partial_kernel<<<dim3(p.splits, p.batch), BLOCK, 0, stream>>>(
+  topk_partial_kernel<PARTIAL_ALL><<<dim3(p.splits, p.batch), BLOCK, 0, stream>>>(
       reinterpret_cast<const uint16_t*>(logits.data_ptr()),
       reinterpret_cast<uint64_t*>(partial.data_ptr()), p.vocab, p.n_vec, p.splits, p.K);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -306,4 +339,46 @@ torch::Tensor topk_fused(torch::Tensor logits, int64_t top_k, int64_t splits_ove
       p.K, p.P);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return ids;
+}
+
+// ablation probe: run phases 1..phase of the pipeline and stop. differences between adjacent
+// phases give a measured cost breakdown, which is the only attribution available with ncu blocked.
+torch::Tensor probe_phase(torch::Tensor logits, int64_t top_k, double top_p, int64_t phase,
+                          int64_t splits_override) {
+  TORCH_CHECK(phase >= 1 && phase <= PARTIAL_ALL + MERGE_ALL, "phase must be in [1, ",
+              PARTIAL_ALL + MERGE_ALL, "]");
+  const Plan p = make_plan(logits, top_k, splits_override);
+  const bool is_bf16 = logits.scalar_type() == at::kBFloat16;
+
+  // both tensors are allocated at every phase so the allocator's cost is constant across the sweep
+  auto out = torch::empty({p.batch}, logits.options().dtype(torch::kInt64));
+  auto partial = torch::empty({p.batch, p.splits, p.K}, logits.options().dtype(torch::kInt64));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* x = reinterpret_cast<const uint16_t*>(logits.data_ptr());
+  auto* pw = reinterpret_cast<uint64_t*>(partial.data_ptr());
+  const dim3 grid(p.splits, p.batch);
+
+  switch (phase) {
+    case 1: topk_partial_kernel<1><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
+    case 2: topk_partial_kernel<2><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
+    case 3: topk_partial_kernel<3><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
+    case 4: topk_partial_kernel<4><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
+    default: topk_partial_kernel<PARTIAL_ALL><<<grid, BLOCK, 0, stream>>>(x, pw, p.vocab, p.n_vec, p.splits, p.K); break;
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (phase <= PARTIAL_ALL) return out;
+
+  const int ms = static_cast<int>(phase) - PARTIAL_ALL;
+  const auto* pr = reinterpret_cast<const uint64_t*>(partial.data_ptr());
+  auto* o = out.data_ptr<int64_t>();
+  const float tp = static_cast<float>(top_p);
+  if (is_bf16) {
+    if (ms == 1) merge_sample_kernel<true, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull);
+    else merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull);
+  } else {
+    if (ms == 1) merge_sample_kernel<false, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull);
+    else merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
 }

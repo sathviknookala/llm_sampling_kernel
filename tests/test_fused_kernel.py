@@ -147,3 +147,40 @@ def test_committed_floor_artifact_brackets_the_kernel():
     scans = [float(r["median_us"]) for r in rows if r["op"].startswith("scan")]
     assert max(noop) < 5.0, "launch floor moved; the spike's headroom claim assumes ~2.5 us"
     assert min(scans) > max(noop), "a full pass cannot be cheaper than an empty launch"
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("batch", [1, 8])
+def test_the_last_ablation_phase_is_the_production_path(batch, dtype):
+    # results/raw/kernel_phases.csv differences two timings per phase, which only attributes the
+    # real kernel if the final phase *is* the real kernel. probe_phase pins seed/offset to 0.
+    import fused_sampling
+
+    torch.manual_seed(0)
+    x = (torch.randn(batch, 4000, device="cuda") * 4).to(dtype)
+    for top_k in (20, 50):
+        got = fused_sampling.probe_phase(x, top_k, 0.9, 7, 0)
+        want = fused_sampling.sample_fused(x, top_k, 0.9, 0, 0, 0)
+        assert torch.equal(got, want)
+
+
+def test_early_ablation_phases_stop_before_the_answer_exists():
+    # a phase that silently ran to completion would make every delta zero and the artifact a lie
+    import fused_sampling
+
+    torch.manual_seed(0)
+    x = (torch.randn(4, 4000, device="cuda") * 4).to(torch.bfloat16)
+    full = fused_sampling.probe_phase(x, 50, 0.9, 7, 0)
+    for phase in (1, 2, 3, 4, 5, 6):
+        early = fused_sampling.probe_phase(x, 50, 0.9, phase, 0)
+        assert early.shape == full.shape
+    assert not torch.equal(fused_sampling.probe_phase(x, 50, 0.9, 6, 0), full)
+
+
+def test_ablation_rejects_phases_outside_the_pipeline():
+    import fused_sampling
+
+    x = torch.zeros(2, 4000, device="cuda", dtype=torch.bfloat16)
+    for phase in (0, -1, 8):
+        with pytest.raises(RuntimeError):
+            fused_sampling.probe_phase(x, 50, 0.9, phase, 0)

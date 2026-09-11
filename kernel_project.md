@@ -27,6 +27,8 @@ This file is the always-loaded hub — keep it thin. Pull the reference doc that
   `flashinfer_from_probs`, the launch/full-pass floors that bound it, the design, and what is
   still uncertified. *Read before touching `csrc/`.*
 - **`results/summary_spike.md`** — generated summary over `results/raw/spike_ladder.csv`.
+- **`benchmarks/kernel_phases.py`** — the phase ablation behind `SPIKE.md` §2.1: runs phases 1..n
+  of the real kernel and stops, so the cost breakdown is measured rather than inferred.
 - **`results/summary_ladder.md`** — generated summary tables over the raw sweep.
 - **`benchmarks/regime.py`** — the single source for shapes, dtypes, and anchors. Do not hardcode
   these in a script; import them.
@@ -195,44 +197,55 @@ A speedup against HF eager is not a result: `tight_eager`, ordinary eager PyTorc
 **The spike is done and the kernel exists.** `csrc/fused_sampling.cu` runs the whole operation --
 `[B, V]` logits to one token id -- in **20.6 us at B=1**, against **74.0 us** for
 `flashinfer_from_probs` measured in the same process. Across the grid the win is **2.5x-4.3x**.
-266 tests + 2 skipped. **Read `results/SPIKE.md` before touching `csrc/`.**
+272 tests + 2 skipped. **Read `results/SPIKE.md` before touching `csrc/`.**
 
 The honest qualifier: `DECISION.md` §6 projected 5-20x at low batch and this prototype does not
 reach it. The reason is measured, not guessed -- `results/raw/kernel_floor.csv` puts one full pass
 over the vocabulary at **4.56 us** (B=1) and the dispatch floor at **2.57 us**, so the kernel sits
-**4.5x above its own floor**. That gap is three row passes, ~50 block syncs, and a 55-stage bitonic
-merge. Quote 3.59x, not the projection.
+**4.5x above its own floor**. Quote 3.59x, not the projection.
+
+**Where that gap goes is now measured, not inferred** (`results/raw/kernel_phases.csv`, 1215 rows;
+breakdown in `results/raw/kernel_phase_breakdown.csv`, `SPIKE.md` §2.1). At B=1, k=50: the merge
+kernel is **50%** of the 20.5 us and its bitonic sort alone is 40%; the three row passes are 37%;
+the two boundary searches are 0.5%, i.e. free. At B=32 it inverts -- traversals 66%, merge 26%.
+The earlier guess that split the gap evenly across passes, syncs and the merge was wrong.
 
 Next, in order:
 
-1. Replace the tie-buffer clamp with a radix pass on the index, then run **Gate A** elementwise
+1. **Attack the merge kernel** -- half the cost at B=1 and it runs in one block there. Sort each
+   split's candidates in `topk_partial_kernel` (which has `splits x B` blocks) so the merge becomes
+   a bitonic merge of sorted runs, not a 45-stage full sort. Partials are gathered in arbitrary
+   atomic order today, so the sort has to be added, not just exploited
+2. Halve every bitonic stage -- `bitonic_ascending`'s `if (ixj > i)` idles half the threads in each
+   of 36-55 stages
+3. Replace the tie-buffer clamp with a radix pass on the index, then run **Gate A** elementwise
    (`keep` / `renormed`, not just `topk_ids`)
-2. Collapse the three row passes into one register-resident warp select, and the bitonic merge into
-   a radix select -- the floor says ~4x remains
-3. Re-measure and decide whether §6's 5-20x is reachable or should be retired
+4. Collapse the three row passes into one register-resident warp select -- still worth 37% at B=1
+   and 66% at B=32, but no longer the first move
+5. Re-measure and decide whether §6's 5-20x is reachable or should be retired
 
 ## Last Session
 
-**Session 7 -- the first CUDA in the repo, and the spike closed.** Four commits:
+**Session 8 -- B0 of the roadmap: the phase attribution is now measured.** `ncu` is blocked here,
+so `csrc/fused_sampling.cu` is templated on a `STOP` phase: the kernel runs phases 1..n of itself
+and returns, and each phase costs a difference of two timings on the ladder's own instrument.
 
-- **Floors first, and they paid for themselves.** Before writing the kernel, three probes bounded
-  what any kernel could reach here: `noop` 2.57 us, one full pass split across SMs 4.56 us at B=1.
-  That killed the worry that the 74 us bar was mostly instrument, and picked the grid shape. The
-  same artifact later explained the kernel's remaining gap
-- **The regime restriction is what makes the kernel simple.** fp16 and bf16 are both 16-bit
-  sign-magnitude, so one order-preserving map serves both and selection needs **two 8-bit radix
-  passes, not the four fp32 would need**. Packing `(key, ~idx)` into 64 bits makes "lowest token id
-  wins" a single comparison -- `topk_ids` matches `reference.py` **exactly in 40/40 configurations**,
-  bf16 included, where ~93% of rows have a k-boundary tie
-- **The kernel is latency-bound on its own phase chain, not throughput-bound.** At `k=20` with 8
-  splits, B=1/4/8 all take 18.5 us despite 8x the work. Adding blocks stops paying by 4-8 splits
-  even with 70 SMs idle. The split rule `clamp(128/B, 4, 8)` comes from `kernel_splits.csv`, not
-  from SM count
-- **The test suite was falsified, not just run.** Inverting the index half of the packed key fails
-  32 of the 51 kernel tests. An empty-split bug that wrote out of bounds was found by the tests,
-  not by inspection
-- Built and benchmarked in `~/.venv_flashinfer` so the kernel and FlashInfer are timed in one
-  process; 1134 sweep rows, round-to-round spread 0.4% -- the tightest rung in the ladder
+- **The headline finding reversed the roadmap.** The merge kernel, not the row passes, is half the
+  cost at B=1. Confirmed by mechanism rather than correlation: merge cost tracks the bitonic
+  *stage* count across k -- 6.29/8.23/13.02 us for 36/45/55 stages, ~0.18 us per stage
+- **The probe design had to be fixed before it measured anything.** `-Xptxas -v` showed the
+  truncated instantiations were 8192 bytes lighter in shared memory -- the compiler drops `tie[]`
+  when no reachable code touches it -- so the ablation would have compared occupancies. The shared
+  arrays are now one allocation, identical across every instantiation
+- **A timed run was contaminated and thrown away.** Ran pytest on the GPU while the sweep was
+  measuring. Killed it, reordered so every GPU-touching step finishes before the sweep launches,
+  re-ran clean. The `full` control agrees with phase 7 to 0.04-0.39%
+- **A ~2.05 us quantum at B<=8 is real and unexplained.** Cumulative phase times land on near-exact
+  integer multiples of it, so sub-2 us phase boundaries are not resolvable at low batch -- only
+  their groups are. Within-round rep spread is 0.0-0.1%, so it is not rep noise. Documented in
+  `SPIKE.md` §2.1 rather than explained away
+- Six review agents added under `.claude/agents/`, and `kernel_project.md` refreshed as a tracked
+  mirror of this file (which is gitignored)
 
 ## Known Issues
 
@@ -295,11 +308,21 @@ Next, in order:
   is the semantic reference and is not the timed baseline, so this is deliberate — but it means
   the reference is no longer a "tight eager" *timing* rung. If such a rung is wanted in the ladder,
   it needs a separate topk-based implementation, explicitly labelled as not tie-exact.
+- **A ~2.05 us timing quantum at B<=8 is real, reproducible, and unexplained.** In
+  `results/raw/kernel_phases.csv` the cumulative phase timings land on near-exact integer
+  multiples of it (2, 2, 3, 3, 5, 9, 10 x 2.053 at B=1, k=50), so a ~2 us step migrates between
+  adjacent phases from round to round. Within-round rep spread is 0.0-0.1%, so it is not rep
+  noise, and 9 rounds did not average it out. Consequence: **individual sub-2 us phase deltas at
+  B<=8 are not resolvable** -- report groups (phases 3-5 together are stable to 0.8%). It does not
+  touch the merge or traversal numbers, which are much larger. Unlocked clocks are the suspect but
+  nothing has been measured to confirm it.
 - **Profiling is confirmed blocked, not merely unconfirmed.** `/proc/driver/nvidia/params` reports
   `RmProfilingAdminOnly: 1`, the driver default, and nothing in `/etc/modprobe.d/` overrides it.
   `ncu` is installed (2025.2.1.0) but a non-root run returns `ERR_NVGPUCTRPERM`. Every attribution
   in `results/SPIKE.md` is therefore wall-clock. A fix needs
-  `NVreg_RestrictProfilingToAdminUsers=0` plus a reboot, or `sudo ncu`.
+  `NVreg_RestrictProfilingToAdminUsers=0` plus a reboot, or `sudo ncu`. **The substitute is the
+  `STOP`-templated phase ablation** (`benchmarks/kernel_phases.py`), which needs no permissions;
+  `compute-sanitizer` and `nvcc -Xptxas -v` are also available unprivileged.
 - **The register-residency premise is still borrowed, and the current kernel does not use it.**
   Candidates live in shared memory, not registers, and the selection is a three-pass radix rather
   than a one-pass register-resident warp select. The ~4x remaining against the measured floor is
