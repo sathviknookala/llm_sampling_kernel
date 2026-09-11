@@ -196,3 +196,62 @@ def test_ablation_rejects_phases_outside_the_pipeline():
     for phase in (0, -1, 8):
         with pytest.raises(RuntimeError):
             fused_sampling.probe_phase(x, 50, 0.9, phase, 0)
+
+
+def _stage_gap(x, top_k, top_p):
+    import fused_sampling
+
+    ref = stages(x, top_k, top_p)
+    _, keep, renormed = fused_sampling.stages_fused(x, top_k, top_p, 0, 0, 0)
+    ulp = (renormed[ref.keep].view(torch.int32)
+           - ref.renormed.float()[ref.keep].view(torch.int32)).abs()
+    return keep, ref.keep, renormed, ref.renormed.float(), (ulp.max().item() if ulp.numel() else 0)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("top_p", [0.9, 0.95, 1.0])
+@pytest.mark.parametrize("top_k", [1, 20, 50, 100])
+def test_gate_a_keep_mask_matches_the_reference_exactly(top_k, top_p, dtype):
+    # the kernel cuts on the same expression reference.py does -- (c_i - p_i) < top_p, normalized
+    # before the prefix -- so this is exact, not approximate. a/z < p and a < p*z are not.
+    torch.manual_seed(0)
+    x = (torch.randn(64, 151936, device="cuda") * 4).to(dtype)
+    keep, ref_keep, _, _, _ = _stage_gap(x, top_k, top_p)
+    assert torch.equal(keep, ref_keep)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("top_k", [20, 50, 100])
+def test_gate_a_renormed_matches_the_reference_to_a_few_ulp(top_k, dtype):
+    # not bitwise: torch sums the prefix with a scan and the kernel sums it serially. 15 ulp is
+    # the worst observed over the regime grid; 64 is headroom, not a licence for a wrong formula.
+    torch.manual_seed(0)
+    x = (torch.randn(64, 151936, device="cuda") * 4).to(dtype)
+    _, ref_keep, renormed, ref_renormed, ulp = _stage_gap(x, top_k, 0.9)
+    assert ulp <= 64, f"renormed drifted {ulp} ulp from the reference"
+    assert torch.allclose(renormed, ref_renormed, atol=2e-6, rtol=0)
+    assert (renormed[~ref_keep] == 0).all(), "dropped candidates must carry zero mass"
+
+
+def test_gate_a_renormed_sums_to_one_over_the_nucleus():
+    torch.manual_seed(0)
+    x = (torch.randn(32, 151936, device="cuda") * 4).to(torch.bfloat16)
+    for top_p in (0.9, 0.95, 1.0):
+        _, _, renormed, _, _ = _stage_gap(x, 50, top_p)
+        assert torch.allclose(renormed.sum(-1), torch.ones(32, device="cuda"), atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("top_p,expected_kept", [(0.25, 2), (0.5, 4), (0.75, 6), (0.875, 7)])
+def test_gate_a_cut_lands_exactly_on_the_boundary(top_p, expected_kept, dtype):
+    # eight equal logits make every prob exactly 1/8 and every prefix exactly i/8 in fp32, so the
+    # exclusive prefix sits *on* top_p. the strict < in reference.py then drops the boundary token.
+    # gaussian logits never land here, which is why the general keep test cannot catch a wrong
+    # comparison on its own.
+    import fused_sampling
+
+    x = torch.full((4, 4000), -30.0, device="cuda", dtype=dtype)
+    x[:, :8] = 10.0
+    _, keep, _ = fused_sampling.stages_fused(x, 8, top_p, 0, 0, 0)
+    assert keep.sum(-1).tolist() == [expected_kept] * 4
+    assert torch.equal(keep, stages(x, 8, top_p).keep)

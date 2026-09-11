@@ -281,9 +281,12 @@ __device__ __forceinline__ void merge_sort_shared(const uint64_t* __restrict__ s
 }
 
 template <bool IS_BF16, int STOP>
+// keep_out / renormed_out are the Gate A stage tensors; nullptr on the production path, so the
+// gate measures the kernel's own arithmetic rather than a parallel copy of it
 __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
                                     int64_t* __restrict__ out, int splits, int K, int P,
-                                    float top_p, uint64_t seed, uint64_t offset) {
+                                    float top_p, uint64_t seed, uint64_t offset,
+                                    bool* __restrict__ keep_out, float* __restrict__ renormed_out) {
   __shared__ uint64_t buf[MERGE_CAP];
   __shared__ float w[K_CAP];
   __shared__ float cum[K_CAP];
@@ -305,23 +308,26 @@ __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
 
   if (t == 0) {
     float z = 0.0f;
+    for (int i = 0; i < K; ++i) z += w[i];
+    // reference.py normalizes first and then takes the prefix. a/z < p and a < p*z are not the
+    // same comparison in fp32, so match the op order rather than the algebra.
+    float c = 0.0f;
     for (int i = 0; i < K; ++i) {
-      z += w[i];
-      cum[i] = z;
+      w[i] /= z;
+      c += w[i];
+      cum[i] = c;
     }
-    // reference.py keeps i iff the exclusive prefix of the normalized probs is < top_p;
-    // scaling by z avoids materializing them
-    const float cut = top_p * z;
     int r = K - 1;
     if (top_p < 1.0f) {
       for (int i = 1; i < K; ++i) {
-        if (cum[i - 1] >= cut) {
+        if (!((cum[i] - w[i]) < top_p)) {
           r = i - 1;
           break;
         }
       }
     }
-    const float u = fs::rng_uniform(seed, offset, static_cast<uint32_t>(b)) * cum[r];
+    const float zp = cum[r];
+    const float u = fs::rng_uniform(seed, offset, static_cast<uint32_t>(b)) * zp;
     int pick = r;
     for (int i = 0; i <= r; ++i) {
       if (cum[i] >= u) {
@@ -330,6 +336,14 @@ __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
       }
     }
     out[b] = static_cast<int64_t>(fs::unpack_idx(buf[P - 1 - pick]));
+    if (keep_out != nullptr) {
+      bool* ko = keep_out + static_cast<size_t>(b) * K;
+      float* ro = renormed_out + static_cast<size_t>(b) * K;
+      for (int i = 0; i < K; ++i) {
+        ko[i] = (i <= r);
+        ro[i] = (i <= r) ? w[i] / zp : 0.0f;
+      }
+    }
   }
 }
 
@@ -405,11 +419,11 @@ torch::Tensor sample_fused(torch::Tensor logits, int64_t top_k, double top_p, in
   if (is_bf16) {
     merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
         pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset));
+        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), nullptr, nullptr);
   } else {
     merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
         pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset));
+        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), nullptr, nullptr);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
@@ -465,12 +479,45 @@ torch::Tensor probe_phase(torch::Tensor logits, int64_t top_k, double top_p, int
   auto* o = out.data_ptr<int64_t>();
   const float tp = static_cast<float>(top_p);
   if (is_bf16) {
-    if (ms == 1) merge_sample_kernel<true, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull);
-    else merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull);
+    if (ms == 1) merge_sample_kernel<true, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, nullptr, nullptr);
+    else merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, nullptr, nullptr);
   } else {
-    if (ms == 1) merge_sample_kernel<false, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull);
-    else merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull);
+    if (ms == 1) merge_sample_kernel<false, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, nullptr, nullptr);
+    else merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, nullptr, nullptr);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+// debug entry point: the Gate A stage tensors, straight out of the production merge kernel
+std::vector<torch::Tensor> stages_fused(torch::Tensor logits, int64_t top_k, double top_p,
+                                        int64_t seed, int64_t offset, int64_t splits_override) {
+  TORCH_CHECK(top_p > 0.0 && top_p <= 1.0, "top_p must be in (0, 1]");
+  const Plan p = make_plan(logits, top_k, splits_override);
+  const bool is_bf16 = logits.scalar_type() == at::kBFloat16;
+  auto i64 = logits.options().dtype(torch::kInt64);
+  auto out = torch::empty({p.batch}, i64);
+  auto partial = torch::empty({p.batch, p.splits, p.K}, i64);
+  auto keep = torch::empty({p.batch, p.K}, logits.options().dtype(torch::kBool));
+  auto renormed = torch::empty({p.batch, p.K}, logits.options().dtype(torch::kFloat32));
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  topk_partial_kernel<PARTIAL_ALL><<<dim3(p.splits, p.batch), BLOCK, 0, stream>>>(
+      reinterpret_cast<const uint16_t*>(logits.data_ptr()),
+      reinterpret_cast<uint64_t*>(partial.data_ptr()), p.vocab, p.n_vec, p.splits, p.K, p.shift);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const auto* pp = reinterpret_cast<const uint64_t*>(partial.data_ptr());
+  auto* kp = keep.data_ptr<bool>();
+  auto* rp = renormed.data_ptr<float>();
+  if (is_bf16) {
+    merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
+        pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
+        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), kp, rp);
+  } else {
+    merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
+        pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
+        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), kp, rp);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {out, keep, renormed};
 }
