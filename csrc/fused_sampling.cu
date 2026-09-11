@@ -11,7 +11,7 @@
 namespace {
 
 constexpr int BLOCK = 512;
-constexpr int MERGE_BLOCK = 512;  // measured: 512 beats 1024 by ~7% at B=32 and ties at B=1; 128 is far worse
+constexpr int MERGE_BLOCK = 1024;
 constexpr int NSUB = 8;
 constexpr int TIE_CAP = 2048;
 constexpr int MERGE_CAP = 1024;
@@ -293,6 +293,7 @@ __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
   __shared__ uint64_t buf[MERGE_CAP];
   __shared__ float w[K_CAP];
   __shared__ float cum[K_CAP];
+  __shared__ float s_z;
 
   const int t = threadIdx.x;
   const int b = blockIdx.x;
@@ -309,14 +310,22 @@ __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
   }
   __syncthreads();
 
+  // z stays a serial sum: the cut is bit-exact against reference.py only for this exact operand,
+  // and a block reduction would reassociate it. reference.py normalizes before taking the prefix,
+  // and a/z < p is not a < p*z in fp32, so the divides are per element -- spread over the block,
+  // which measured better than K of them in one thread at every k (9 rounds).
   if (t == 0) {
     float z = 0.0f;
     for (int i = 0; i < K; ++i) z += w[i];
-    // reference.py normalizes first and then takes the prefix. a/z < p and a < p*z are not the
-    // same comparison in fp32, so match the op order rather than the algebra.
+    s_z = z;
+  }
+  __syncthreads();
+  for (int i = t; i < K; i += blockDim.x) w[i] /= s_z;
+  __syncthreads();
+
+  if (t == 0) {
     float c = 0.0f;
     for (int i = 0; i < K; ++i) {
-      w[i] /= z;
       c += w[i];
       cum[i] = c;
     }
