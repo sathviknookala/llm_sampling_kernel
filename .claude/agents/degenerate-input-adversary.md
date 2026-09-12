@@ -1,6 +1,6 @@
 ---
 name: degenerate-input-adversary
-description: Hunts for inputs that break the fused kernel — unaligned or indivisible V, V < K, empty splits, all-equal rows, -inf and denormals, and the TIE_CAP clamp. Use after any change to make_plan, the slice arithmetic, or the tie path.
+description: Hunts for inputs that break the fused kernel — unaligned or indivisible V, V < K, empty splits, all-equal rows, -inf and denormals, and the exact-tie fallback. Use after any change to make_plan, the slice arithmetic, or the tie path.
 tools: Read, Grep, Glob, Bash
 ---
 
@@ -29,11 +29,15 @@ empty split already caused an out-of-bounds shared write once — found by tests
 - **`-inf`, `+inf`, NaN, denormals, and `-0.0`** in fp16 and bf16. Check the monotone key
   `mono_key` maps these consistently with the reference's ordering, and read SEMANTICS.md's
   NaN/Inf policy before deciding whether a difference is a bug or out of contract.
-- **`TIE_CAP = 2048`** — the documented clamp. `results/raw/tie_fidelity.csv` shows max observed
-  tie multiplicity of 14, so this has never been tripped on real data. **Actually trip it**:
-  construct a row with >2048 tokens sharing the exact k-th value inside one slice, and characterize
-  what the kernel emits. The claim under test is "retained values still right, only which tied id
-  is emitted changes." Confirm or refute it.
+- **The exact-tie fallback**, which runs when the per-split tie set exceeds `TIE_CAP = 2048`. The
+  clamp it replaced is gone and the answer is claimed **exact at any multiplicity**. Real logits
+  never reach it (max multiplicity 14 in `results/raw/tie_fidelity.csv`), so this path is exercised
+  only by construction — which makes it the least-trodden code in the kernel and your best target.
+  It buckets the index by `i >> shift` into at most 256 bins and marks the boundary bin in a
+  bitmap. Attack the bound: vocabularies where `V >> shift` lands exactly on 256, `V` just over a
+  power of two, `shift == 0`, a boundary bin that is entirely full, and a `need` that falls exactly
+  on a bin edge. The capacity claim is that the bin is `2^shift` wide so the bitmap cannot
+  overflow — test the arithmetic that picks `shift`, not just the happy path.
 
 ## Rules
 

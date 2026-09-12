@@ -27,7 +27,8 @@ whether the sweep needs re-running or only the provenance field needs fixing.
 
 ## Fairness of the comparison
 
-The headline is 3.59x over `flashinfer_from_probs`. Interrogate it:
+The headline is 3.35x over `flashinfer_from_probs` (22.5 µs against 75.4 at B=1, k=50).
+Interrogate it:
 
 - FlashInfer is handed a `[B, V]` probability tensor someone else softmaxed; the kernel consumes
   raw logits and softmaxes itself. `results/SPIKE.md` claims this makes the comparison unfavourable
@@ -46,8 +47,10 @@ The headline is 3.59x over `flashinfer_from_probs`. Interrogate it:
 - Whether every claim marked as a floor is labelled as a floor and states what it excludes.
 - Whether the Amdahl ceiling (0.16-1.2% of a decode step, `results/raw/amdahl_probe.csv`) is
   attached wherever an end-to-end implication could be read into the text.
-- Whether `DECISION.md` §6's "5-20x" projection is consistently marked as unmet, with 3.59x as the
-  headline.
+- Whether `DECISION.md` §6's "5-20x" projection is consistently marked as unmet, with 3.35x as the
+  headline. **3.59x is a real number from commit 33802d7 that no longer reproduces** -- closing
+  Gate A cost 9-19%. Any doc still quoting it is drifted, and any doc quoting 3.35x without saying
+  the kernel got slower is incomplete.
 - Whether `results/summary_*.md` regenerate from their raw CSVs identically today.
 
 ## Rules

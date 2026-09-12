@@ -89,6 +89,30 @@ Isolated stage timings do not sum exactly to the measured total — each stage p
 and the allocator behaves differently in isolation. They are an attribution tool, not a
 decomposition identity.
 
+### Phase ablation, for the fused kernel
+
+`benchmarks/kernel_phases.py` attributes cost *inside* the fused kernel, where isolation is not
+available and `ncu` is blocked. `topk_partial_kernel` and `merge_sample_kernel` are templated on a
+`STOP` phase: each instantiation runs phases 1..n of the real kernel, sinks live state so nothing
+is dead-code eliminated, and returns. A phase's cost is then the difference of two timings on this
+same instrument.
+
+Unlike isolated stage timing, this **is** a decomposition — the phases are cumulative and the last
+one is the production path. Two properties keep it honest, and both must hold for the artifact to
+mean anything:
+
+- **The final phase must be bit-identical to production.** `sample_fused` is timed alongside it as
+  a `full` control row; they agree to 0.04% at the anchor point and within 1.4% across the whole
+  grid, the residual being the quantum below rather than a code difference.
+  `tests/test_fused_kernel.py` pins the output equality so the ablation cannot silently diverge
+  from the kernel it claims to describe.
+- **Every instantiation must reserve the same shared memory.** The compiler drops shared arrays no
+  reachable code touches, which made the truncated phases 8192 bytes lighter and would have turned
+  the ablation into an occupancy comparison. The arrays are one allocation for this reason; check
+  it with `nvcc -Xptxas -v` after any change to the phase structure.
+
+**Sub-2 µs phase deltas at B≤8 are not resolvable.** See Limitations.
+
 ## GPU state
 
 Recorded in `results/raw/environment.json` on every run: GPU name, SM version, L2 size, SM count,
@@ -159,5 +183,13 @@ PATH=~/.venv_flashinfer/bin:/home/sathvik/cuda-12.9/bin:$PATH \
 - **Synthetic Gaussian logits.** Real decode logits are heavy-tailed. This changes tie density and
   can change top-p cutoff positions, so per-stage costs may shift on real data.
 - **No `ncu` counters.** DRAM traffic is a computed floor from a measured copy bandwidth, not
-  measured traffic; `ncu` permissions are unverified on this machine.
+  measured traffic. `ncu` is **confirmed blocked**, not merely unverified: `/proc/driver/nvidia/params`
+  reports `RmProfilingAdminOnly: 1` and a non-root run returns `ERR_NVGPUCTRPERM`. The substitutes
+  that need no permission are the phase ablation above, `compute-sanitizer`, and `nvcc -Xptxas -v`.
+- **A ~2.05 µs timing quantum at B≤8, reproducible and unexplained.** Cumulative phase timings land
+  on near-exact integer multiples of it, so a ~2 µs step migrates between adjacent phases from
+  round to round. Within-round rep spread is 0.0–0.1%, so it is not rep noise, and nine rounds do
+  not average it out. **Consequence: report groups, not individual sub-2 µs phases, at low batch**,
+  and do not call a few-percent kernel change at B=1 from a three-round sweep — one such reading
+  was reversed by nine rounds (`results/SPIKE.md` §7).
 - **`torch.compile` runs at default mode.** `max-autotune` was not swept.

@@ -8,14 +8,15 @@ You review everything between Python and the CUDA launch: `setup.py`, `csrc/bind
 `make_plan` and the `sample_fused` / `topk_fused` entry points in `csrc/fused_sampling.cu`, and
 `benchmarks/fused.py`.
 
-## Known open item, to confirm and characterize rather than rediscover
+## Known state, so you do not rediscover it
 
-`benchmarks/fused.py` draws the RNG offset from a module-level `itertools.count()` on the host. A
-CUDA-graph capture bakes the offset into the graph, so every replay would return the same token —
-the failure appears only in the deployment mode the project cares about, and the current ladder
-has no graph rung for the kernel to catch it. Confirm it empirically with a capture and replay,
-then evaluate taking the offset from PyTorch's own generator
-(`getDefaultCUDAGenerator().philox_cuda_state()`, unpacked device-side) as dropout does.
+The host-counter RNG bug is **fixed**: the offset now comes from torch's default CUDA generator via
+`PhiloxCudaState`, unpacked device-side, and `offset < 0` selects that path. Three tests pin it.
+Verify it has not regressed and that the explicit-offset path is still reproducible — but do not
+spend the review re-deriving it.
+
+**The ladder still has no graph rung for `fused_kernel`.** The bug lived off the measured path
+once; the measurement gap that hid it is still open.
 
 ## What else to check
 

@@ -28,6 +28,17 @@ search that matches no bucket leaves the scalar uninitialized — trace whether 
 participating lane is active at each `__shfl_*_sync`, including partial final warps when
 `blockDim.x` is not a multiple of 32 and when the caller entered under a predicate.
 
+**The exact-tie fallback (`exact_ties`).** Newest and least-trodden code in the kernel: it takes a
+generic lambda, re-histograms the index, and walks a bitmap in a single warp. Check that its
+`__syncthreads()` calls are reachable by the whole block given it is called under `if (need > 0)`
+and `else` of a `s_n_tie <= TIE_CAP` test, that `*s_bb` / `*s_below` are always written before
+read, and that the single-warp bitmap walk's `__shfl_*_sync(0xFFFFFFFF, ...)` has all 32 lanes
+active.
+
+**The unified shared allocation.** `smem[]` is one array carved into `hist` / `suf` / `tie` /
+`cand` by pointer arithmetic, so a bad offset silently aliases two logical arrays instead of
+failing to compile. Verify the carve-up and the `uint64_t` alignment of `cand`.
+
 **Bounds.** `cand[K_CAP]`, `tie[TIE_CAP]`, `buf[MERGE_CAP]`, `w`/`cum[K_CAP]`. For each write,
 derive the maximum index from the host-side `Plan` in `make_plan` and the `TORCH_CHECK`s, and say
 whether the bound is enforced or merely expected. `cand[n_gt + i]` is the one that already caused

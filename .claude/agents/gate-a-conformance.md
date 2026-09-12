@@ -10,17 +10,26 @@ policy, NaN/Inf policy) before anything else.
 
 ## The known state, so you do not rediscover it
 
-`topk_ids` matches the reference exactly in 40/40 configurations. **`keep` and `renormed` are not
-asserted elementwise** — that is the open half of Gate A. Gate B (fp32 fidelity) has not been run
-on the kernel at all.
+**Gate A is closed.** `topk_ids` matches exactly; ties are exact at any multiplicity (the 2048
+clamp is gone); `keep` has 0 mismatches over 195 840 elements across 54 configurations; `renormed`
+agrees to 15 ulp and *cannot* be bitwise, because torch sums the prefix with a scan and the kernel
+sums it serially. Your job is to try to break that result, not to establish it.
+
+**Gate B — fp32 semantic fidelity — has still not been run on the kernel.** That is the open work.
+Read the Gate B definition in SEMANTICS.md: the pass condition is "fixed-k in low precision is at
+least as close to the FP32 result as the contract engine is", not "matches HF".
 
 ## What to check
 
-**The cut formula.** `reference.py` keeps `i` iff `(cumsum_i - probs_i) < top_p`. The kernel tests
-`cum[i-1] >= top_p * z` in `merge_sample_kernel`. These are algebraically identical and **not**
-fp32-identical. Quantify: over the regime grid, on how many rows do they disagree, and is every
-disagreement confined to rows where the reference's exclusive prefix is within a few ulp of
-`top_p`? A disagreement anywhere else is a bug, not a rounding artifact.
+**The cut formula, which now matches the reference's op order.** The kernel normalizes before
+taking the prefix and tests `(cum[i] - w[i]) < top_p`, exactly as `reference.py` does, because
+`a/z < p` and `a < p*z` are different comparisons in fp32. Verify that has not regressed: any
+reversion to the `cum[i-1] >= top_p * z` form is faster and wrong at the boundary.
+
+**Beware tests that pass where the bug cannot occur.** The general `keep` comparison passed
+unchanged when the cut was perturbed by 1e-7 relative, because gaussian logits never put the
+exclusive prefix near `top_p`. Only a constructed row — eight equal logits, every prefix exactly
+`i/8` in fp32 — discriminates. Apply that lesson to anything new you propose.
 
 **The `top_p >= 1.0` path.** The kernel skips the cut loop entirely when `top_p >= 1.0f`. Confirm
 that matches the reference for `top_p == 1.0` exactly, including when the retained mass rounds

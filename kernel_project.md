@@ -23,9 +23,9 @@ This file is the always-loaded hub — keep it thin. Pull the reference doc that
   commands, limitations. *Read before quoting or adding a benchmark number.*
 - **`results/DECISION.md`** — the go/no-go gate and its nine answers, with the revised hypothesis.
   *Read before any kernel work.*
-- **`results/SPIKE.md`** — the prototype spike: the kernel's measured 2.5-4.3x over
-  `flashinfer_from_probs`, the launch/full-pass floors that bound it, the design, and what is
-  still uncertified. *Read before touching `csrc/`.*
+- **`results/SPIKE.md`** — the kernel's measured **2.28-4.09x** over `flashinfer_from_probs`, the
+  floors that bound it, the measured phase breakdown, the closed Gate A, and §7's three measured
+  non-results. *Read before touching `csrc/`.*
 - **`results/summary_spike.md`** — generated summary over `results/raw/spike_ladder.csv`.
 - **`benchmarks/kernel_phases.py`** — the phase ablation behind `SPIKE.md` §2.1: runs phases 1..n
   of the real kernel and stops, so the cost breakdown is measured rather than inferred.
@@ -129,7 +129,10 @@ The surviving hypothesis, narrowed to what the measurements support:
 (`results/raw/amdahl_probe.csv`), so even infinitely fast sampling is invisible end to end. The
 deliverable is an operator-specialization result with an honest Amdahl ceiling attached.
 
-**The bar is `flashinfer_from_probs`** — 72.6 / 73.9 / 101.2 µs at B=1/8/32 — **not `hf_eager`**.
+**The bar is `flashinfer_from_probs`** — **75.4 / 75.5 / 101.2 µs at B=1/8/32**
+(`results/raw/spike_ladder.csv`) — **not `hf_eager`**. The 72.6 / 73.9 µs in `DECISION.md` and
+`summary_ladder.md` is the same rung measured in the pre-kernel sweep
+(`results/raw/sampling_ladder.csv`); both are committed, quote whichever artifact you are citing.
 A speedup against HF eager is not a result: `tight_eager`, ordinary eager PyTorch that collapses to
 `[B, K]`, already gets 10x at B=32.
 
@@ -305,8 +308,11 @@ pair-indexing the bitonic stages (neutral); sorted runs per split with the merge
   distribution where we renormalize within the top-k survivors first. It is a performance rung
   only and is never gated against `reference.py`.
 - **Clocks cannot be locked and persistence mode cannot be set** — `nvidia-smi -lgc` / `-pm` both
-  return insufficient permissions. Every benchmark row carries `clocks_locked=false`. Measured
-  round-to-round spread is 0.5-2.3%, so it is bounded but uncontrolled.
+  return insufficient permissions. Every benchmark row carries `clocks_locked=false`. In
+  `results/raw/spike_ladder.csv` the *median* round-to-round spread is 0.2-0.5% per rung, but the
+  `fused_kernel` rung's **worst case is 18%** against 1.4% for `flashinfer_from_probs` — the same
+  ~2.05 us quantum as the phase data, and the reason a 3-round sweep cannot settle a few-percent
+  kernel change at B=1.
 - **`reference.py` now does a full `[B, V]` sort**, not a `topk`, to get a portable tie-break. It
   is the semantic reference and is not the timed baseline, so this is deliberate — but it means
   the reference is no longer a "tight eager" *timing* rung. If such a rung is wanted in the ladder,
@@ -328,9 +334,10 @@ pair-indexing the bitonic stages (neutral); sorted runs per split with the merge
   `compute-sanitizer` and `nvcc -Xptxas -v` are also available unprivileged.
 - **The register-residency premise is still borrowed, and the current kernel does not use it.**
   Candidates live in shared memory, not registers, and the selection is a three-pass radix rather
-  than a one-pass register-resident warp select. The ~4x remaining against the measured floor is
-  the reason to try the register design — but with `ncu` blocked, occupancy and spill cannot be
-  measured here, only inferred from wall-clock.
+  than a one-pass register-resident warp select. The **5.0x** remaining against the measured floor
+  (22.5 us against 4.49 us, `results/raw/kernel_floor.csv`) is the reason to try the register
+  design — but with `ncu` blocked, occupancy and spill cannot be measured here, only inferred from
+  wall-clock.
 
 ---
 

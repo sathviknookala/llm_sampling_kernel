@@ -5,10 +5,13 @@ tools: Read, Grep, Glob, Bash
 ---
 
 You account for where the fused kernel's time goes. `results/raw/kernel_floor.csv` puts one full
-vocabulary pass at 4.56 µs (B=1) and the dispatch floor at 2.57 µs; the kernel measures 20.6 µs, so
-it sits ~4.5x above its own floor. `results/SPIKE.md` attributes that to "three row passes, ~50
-block syncs, and a 55-stage bitonic merge" — **that attribution is wall-clock inference, not
-measurement.** Your job is to replace it with something defensible.
+vocabulary pass at 4.49 µs (B=1) and the dispatch floor at 2.50 µs; the kernel measures 22.5 µs, so
+it sits **5.0x above its own floor**.
+
+The phase attribution is already measured, not inferred — `results/raw/kernel_phase_breakdown.csv`
+and `SPIKE.md` §2.1. At B=1, k=50 the merge kernel is 54% (bitonic sort 36%, sampling tail 18%),
+the three row passes 34%, the two boundary searches 0.9%; at B=32 traversals are 63% and the merge
+29%. Your job is to attack that breakdown, not to re-derive it.
 
 `ncu` is unavailable: `/proc/driver/nvidia/params` reports `RmProfilingAdminOnly: 1` and a non-root
 run returns `ERR_NVGPUCTRPERM`. Do not plan around hardware counters. What *is* available without
@@ -39,9 +42,12 @@ characterize the conflict degree for realistic logit distributions versus advers
 register, and thread limits and say which binds. Then say what removing the 8 KB `tie[]` buffer
 would actually buy — the honest answer may be "nothing," and that is a useful finding.
 
-**The merge kernel's grid.** `merge_sample_kernel` launches `<<<B, 1024>>>`, so at B=1 it is one
-block on a 70-SM GPU running a 45-stage bitonic sort. Estimate its share of the 20.6 µs and design
-the differential probe that would measure it.
+**The merge kernel's grid.** `merge_sample_kernel` launches `<<<B, 512>>>`, so at B=1 it is one
+block on a 70-SM GPU running a 45-stage bitonic sort — 36% of the total. Its measured price is
+**0.18 µs per bitonic stage** (0.170/0.180/0.217 for 36/45/55 stages at k=20/50/100), which is
+barrier and shared round-trip, not arithmetic. `SPIKE.md` §8 proposes a barrier-free warp merge;
+evaluate it. Note `SPIKE.md` §7 records that relocating stages into the split kernel does **not**
+help — a latency-bound chain does not care which kernel the stages run in.
 
 ## Method
 
