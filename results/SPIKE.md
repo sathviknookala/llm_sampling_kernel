@@ -94,7 +94,7 @@ derived table. At `V=151936, k=50, bf16, hot`:
 Three things this changes:
 
 - **At low batch the merge kernel is the largest single cost** — 12.2 µs of 22.5 at B=1, of which
-  the bitonic sort is 36%. It launches `<<<B, 512>>>`, so at B=1 it is one block on a 70-SM GPU.
+  the bitonic sort is 36%. It launched `<<<B, 1024>>>`, so at B=1 it is one block on a 70-SM GPU.
   The three row passes together are 34%.
 - **The mechanism is confirmed, not assumed.** Merge cost tracks the bitonic *stage count* across
   `k`: 6.13 / 8.12 / 11.92 µs for 36 / 45 / 55 stages at `k=20/50/100`, i.e. 0.170 / 0.180 / 0.217
@@ -239,17 +239,59 @@ not spend the same time rediscovering them.
   branch. See the resolution caveat above — at B=1 the ~2.05 µs quantum is larger than most of what
   was being compared.
 
-`MERGE_BLOCK` is 512. It measured −7% at B=32 against the pre-Gate-A binary; re-measured after the
-Gate A work it is within noise of 1024 at every `k`. 128 and 256 are clearly worse at B=1.
+`MERGE_BLOCK` is **1024** at the commit these numbers were measured on. 512 measured −7% at B=32
+against the pre-Gate-A binary (`643d369`); re-measured after the Gate A work it was within noise of
+1024 at every `k`, so `df3e3c0` put it back and every artifact here carries 1024. An earlier
+revision of this line said 512, describing a value the tree no longer held. 128 and 256 were
+clearly worse at B=1 — but that was measured when the block itself ran the bitonic sort, which is
+no longer true (§8.2), so it does not transfer to the register merge.
 
 ## 8. Next
 
 1. **Refit the split rule on `k`, not just `B`.** Measured 21.7% at B=1/k=20 and 10.3% at
    B=8/k=20 (§3). Cheapest item here by a wide margin.
-2. **A barrier-free merge.** The merge is the largest single cost at low batch and its price is
-   0.18 µs per bitonic stage — that is barrier and shared-memory round-trip, not arithmetic. Held
-   in registers across one warp with `__shfl_xor`, a cyclic layout makes every `j >= 32` stage
-   purely local and every `j < 32` stage a single shuffle, with no `__syncthreads` at all.
+2. **A barrier-free merge — implemented, NOT YET MEASURED.** The merge is the largest single cost
+   at low batch and its price is 0.18 µs per bitonic stage — barrier and shared-memory round-trip,
+   not arithmetic. `fs::warp_merge_sort` now holds the candidates in one warp's registers and does
+   the whole sort with `__shfl_xor_sync` and zero `__syncthreads`. **Every number in this document
+   predates it and describes the shared-memory bitonic**; the register merge has not been built,
+   tested or timed, and nothing here may be quoted for it. Two departures from the sketch above,
+   both deliberate: the layout is **blocked, not cyclic** — bitonic's inner loop runs `j = k/2 … 1`,
+   so small `j` is the common case, and blocked makes exactly those stages register-local (15
+   shuffle stages at P=512 against cyclic's 35); and `MERGE_BLOCK` drops 1024 → 128, because a
+   1024-thread block caps ptxas at 64 registers per thread and the P=1024 candidate array alone
+   wants 64. That block-size change is confounded with the merge change and has to be reported as
+   one result, not two.
+
+   What **is** measured is the build, which needs no GPU. `ptxas -v` at `sm_120`, production merge
+   (`STOP=2`, bf16), against the same flags on the pre-change source:
+
+   | | baseline (shared bitonic) | P=128 | P=256 | P=512 (k=50) | P=1024 (k=100) |
+   |---|---|---|---|---|---|
+   | registers | 30 | 48 | 88 | 130 | 142 |
+   | spill stores / loads | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | **0 / 0** |
+   | shared bytes | 9220 | 2052 | 3076 | 5124 | 9220 |
+   | `__syncthreads` executed | 49 (P=512) | 4 | 4 | 4 | 4 |
+   | SASS | 27 KB | 73 KB | 123 KB | 236 KB | **451 KB** |
+
+   - **No spill at any width**, which was the design's main failure mode: every register index is a
+     template parameter, so the candidate array cannot lower to local memory. Confirmed, not hoped.
+   - **The block-size change was forced, and now has a number on it.** 130 registers × a
+     1024-thread block is 133K registers against the SM's 65 536, so the old block could not have
+     launched this kernel at all; ptxas would have capped it at 64 and spilled.
+   - **Barriers collapse from 49 to 4, independent of `P`.** The baseline's 5 static `BAR.SYNC` sit
+     inside the runtime `(k, j)` loops and execute once per bitonic stage — 45 at P=512 plus 4
+     around them. The register sort's stages are unrolled and barrier-free, so the only 4 left are
+     the one that publishes `buf` and the three in the softmax tail.
+   - **The shuffle count confirms the layout choice exactly.** SASS shows 4 `SHFL` per 64-bit
+     cross-lane exchange and 15 cross-lane stages at *every* `P` — with 32 lanes the lane-crossing
+     levels are always the top five. Cyclic would make it 35 stages at P=512, 2.3× the shuffles.
+   - **The risk this trades into is instruction footprint**: 236 KB of straight-line SASS at k=50
+     and 451 KB at k=100, 9–17× the baseline, far past any L1 instruction cache. It may not matter
+     — the stream is branch-free and perfectly sequential, which is the best case for a prefetcher
+     — but if the merge does not get faster, this is the first thing to suspect, and the fix is
+     targeted: only the *local* stages need compile-time slot indices, so the 15 cross-lane stages
+     can be re-rolled into a runtime loop and cut the code size roughly in half.
 3. **Run Gate B** — the fp32 fidelity gate, the one gate still not run on the kernel.
 4. Collapse the three row passes into one register-resident warp select — 34% at B=1, 63% at B=32.
 5. Re-measure and decide whether `DECISION.md` §6's 5–20× is reachable or should be retired.
