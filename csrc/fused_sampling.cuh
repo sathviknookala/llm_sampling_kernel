@@ -5,15 +5,11 @@
 
 namespace fs {
 
-// fp16 and bf16 are both sign-magnitude 16-bit, so one order-preserving map covers both:
-// flip all bits when negative, set the sign bit when positive
 __device__ __forceinline__ uint32_t mono_key(uint16_t b) {
   return (b & 0x8000u) ? static_cast<uint32_t>(static_cast<uint16_t>(~b))
                        : static_cast<uint32_t>(static_cast<uint16_t>(b | 0x8000u));
 }
 
-// max over the packed form gives the largest key and, among equal keys, the lowest index --
-// the repo's tie rule falls out of a single 64-bit comparison
 __device__ __forceinline__ uint64_t pack(uint32_t key, uint32_t idx) {
   return (static_cast<uint64_t>(key) << 32) | static_cast<uint64_t>(0xFFFFFFFFu - idx);
 }
@@ -51,7 +47,6 @@ __device__ __forceinline__ uint64_t block_max_u64(uint64_t v, uint64_t* smem) {
   return smem[0];
 }
 
-// forward: positive -> b | 0x8000, negative -> ~b. both are involutions on their half.
 __device__ __forceinline__ uint16_t key_to_bits(uint32_t key) {
   return (key & 0x8000u) ? static_cast<uint16_t>(key & 0x7FFFu)
                          : static_cast<uint16_t>(~key);
@@ -67,7 +62,6 @@ __device__ __forceinline__ float key_to_float(uint32_t key) {
   return __half2float(__ushort_as_half(b));
 }
 
-// splitmix64 on (seed, offset, row) -- the kernel is free to use its own stream, see SEMANTICS.md
 __device__ __forceinline__ float rng_uniform(uint64_t seed, uint64_t offset, uint32_t row) {
   uint64_t z = seed + offset * 0x9E3779B97F4A7C15ull + static_cast<uint64_t>(row) * 0xD1B54A32D192ED03ull;
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -96,7 +90,6 @@ __device__ __forceinline__ void bitonic_ascending(T* s, int n) {
   }
 }
 
-// suf[255-b] = sum_{j>=b} hist[j], done by one warp: 16 block syncs collapse to 1
 __device__ __forceinline__ void suffix_sum_256(const uint32_t* hist, uint32_t* suf) {
   if (threadIdx.x < 32) {
     const int lane = threadIdx.x;
@@ -122,11 +115,6 @@ __device__ __forceinline__ void suffix_sum_256(const uint32_t* hist, uint32_t* s
   __syncthreads();
 }
 
-
-// one warp, candidates in registers, no barriers. blocked layout -- lane L owns [L*R, L*R+R) --
-// so the frequent small-j stages are register-local and only j >= R costs a shuffle; a cyclic
-// layout inverts that and pays 35 shuffle stages at P=512 where this pays 15.
-// every register index is a template parameter, so nothing here can lower to local memory.
 namespace regsort {
 
 template <int R, int K_, int J, int S>
@@ -149,8 +137,6 @@ struct Local<R, K_, J, R> {
   __device__ __forceinline__ static void run(uint64_t (&)[R], int) {}
 };
 
-// J >= R, and J is a power of two, so i ^ J only flips lane bits: the partner is lane ^ (J/R)
-// at the same slot
 template <int R, int K_, int J, int S>
 struct Cross {
   __device__ __forceinline__ static void run(uint64_t (&v)[R], int base) {
@@ -194,10 +180,8 @@ struct Level<R, 1> {
   __device__ __forceinline__ static void run(uint64_t (&)[R], int) {}
 };
 
-}  // namespace regsort
+}
 
-// ascending sort of P packed candidates by warp 0. padding with 0 sorts below every real packed
-// value. only the top K are stored: every reader indexes buf[P-1-i] for i < K.
 template <int P>
 __device__ __forceinline__ void warp_merge_sort(const uint64_t* __restrict__ src, uint64_t* buf,
                                                 int n, int K) {
@@ -216,4 +200,4 @@ __device__ __forceinline__ void warp_merge_sort(const uint64_t* __restrict__ src
   __syncthreads();
 }
 
-}  // namespace fs
+}

@@ -40,7 +40,6 @@ __global__ void scan_rowblock_kernel(const uint16_t* __restrict__ x, int64_t* __
   if (threadIdx.x == 0) out[blockIdx.x] = static_cast<int64_t>(fs::unpack_idx(best));
 }
 
-// grid.x = split, grid.y = row; each block owns a contiguous slice of one row
 __global__ void scan_split_kernel(const uint16_t* __restrict__ x, uint64_t* __restrict__ partial,
                                   int vocab, int n_vec, int splits) {
   __shared__ uint64_t smem[32];
@@ -51,7 +50,6 @@ __global__ void scan_split_kernel(const uint16_t* __restrict__ x, uint64_t* __re
   const int vlo = min(s * vec_per, n_vec);
   const int vhi = min(vlo + vec_per, n_vec);
 
-  // the ragged tail (vocab % 8 elements) goes entirely to the last split
   const int tlo = (s == splits - 1) ? n_vec * 8 : vocab;
 
   uint64_t best = scan_range(row, tlo, vocab, vlo, vhi);
@@ -77,14 +75,13 @@ void check_logits(const torch::Tensor& x) {
               "logits must be float16 or bfloat16");
 }
 
-// vectorised loads are only safe when every row start is 16B aligned
 int vec_chunks(const torch::Tensor& x) {
   const int vocab = static_cast<int>(x.size(-1));
   const bool aligned = (reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0) && (vocab % 8 == 0);
   return aligned ? vocab / 8 : 0;
 }
 
-}  // namespace
+}
 
 torch::Tensor probe_noop(torch::Tensor logits) {
   check_logits(logits);

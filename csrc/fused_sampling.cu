@@ -11,20 +11,16 @@
 namespace {
 
 constexpr int BLOCK = 512;
-// the merge sorts in registers on warp 0: a 1024-thread block caps ptxas at 64 regs/thread,
-// which the P=1024 candidate array alone would consume. the remaining warps serve the K-wide tail.
 constexpr int MERGE_BLOCK = 128;
 constexpr int NSUB = 8;
 constexpr int TIE_CAP = 2048;
 constexpr int MERGE_CAP = 1024;
 constexpr int K_CAP = 128;
-// the last phase of each kernel; the ablation probes instantiate the lower values
 constexpr int PARTIAL_ALL = 5;
 constexpr int MERGE_ALL = 2;
 
 #define SUF(b) suf[255 - (b)]
 
-// one traversal of this block's slice; vector chunks first, then the ragged tail
 template <typename F>
 __device__ __forceinline__ void foreach_key(const uint16_t* __restrict__ row, int vlo, int vhi,
                                             int elo, int ehi, F f) {
@@ -39,10 +35,6 @@ __device__ __forceinline__ void foreach_key(const uint16_t* __restrict__ row, in
   for (int i = elo + threadIdx.x; i < ehi; i += blockDim.x) f(i, fs::mono_key(row[i]));
 }
 
-// exact resolution of a k-boundary tie set too large to buffer. bucket the index into <=256 bins
-// of 2^shift, find the bin holding the need-th smallest, take every tie below it whole, and order
-// only within that bin -- via a bitmap that cannot overflow, since the bin is 2^shift wide.
-// order inside cand does not matter: the merge sorts every candidate anyway.
 template <typename F>
 __device__ __forceinline__ void exact_ties(F foreach, uint32_t* hist, uint32_t* suf, uint32_t* bm,
                                            uint64_t* cand, uint32_t T, int shift, int n_gt,
@@ -67,7 +59,6 @@ __device__ __forceinline__ void exact_ties(F foreach, uint32_t* hist, uint32_t* 
   __syncthreads();
 
   fs::suffix_sum_256(hist, suf);
-  // ascending prefix from the descending scan: pre[b] = total - sum_{j>b}
   const uint32_t total = SUF(0);
   if (t < 256) {
     const uint32_t pre = total - ((t == 255) ? 0u : SUF(t + 1));
@@ -120,15 +111,9 @@ __device__ __forceinline__ void exact_ties(F foreach, uint32_t* hist, uint32_t* 
   __syncthreads();
 }
 
-// exact top-K of one slice of one row, by packed (key desc, index asc).
-// two 8-bit radix passes resolve the 16-bit key; the k-boundary tie then resolves on index.
-// STOP runs phases 1..STOP and sinks live state to `out`, so a phase costs a difference of two
-// measured timings rather than an inference -- ncu is blocked on this box. PARTIAL_ALL is production.
 template <int STOP>
 __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __restrict__ partial,
                                     int vocab, int n_vec_total, int splits, int K, int shift) {
-  // one allocation, so every STOP instantiation reserves the same shared memory -- otherwise the
-  // compiler drops the arrays a truncated phase never reaches and the ablation compares occupancies
   constexpr int HIST_W = NSUB * 256;
   __shared__ __align__(16) uint32_t smem[HIST_W + 256 + TIE_CAP + K_CAP * 2];
   uint32_t* hist = smem;
@@ -156,8 +141,6 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
   }
   const int count = (vhi - vlo) * 8 + (ehi - elo);
   uint64_t* out = partial + (static_cast<size_t>(blockIdx.y) * splits + s) * K;
-  // ceil-divided slices can leave a trailing split empty; padding sorts below every real packed
-  // value, so an empty split simply contributes nothing to the merge
   if (count == 0) {
     for (int i = t; i < K; i += BLOCK) out[i] = 0ull;
     return;
@@ -248,9 +231,6 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
       cand[atomicAdd(&s_n_out, 1)] = fs::pack(k, i);
     } else if (k == T) {
       const int slot = atomicAdd(&s_n_tie, 1);
-      // boundary ties are the common case in bf16 but multiplicity is small (median 4, max 16 in
-      // results/raw/tie_fidelity.csv). past TIE_CAP the retained *values* are still right, only
-      // which tied id is emitted changes -- see results/SPIKE.md
       if (slot < TIE_CAP) tie[slot] = static_cast<uint32_t>(i);
     }
   });
@@ -267,8 +247,6 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
       for (int i = t; i < need; i += BLOCK) cand[n_gt + i] = fs::pack(T, tie[i]);
       __syncthreads();
     } else {
-      // never seen on real logits (max tie multiplicity 14 in results/raw/tie_fidelity.csv), so
-      // the two extra traversals cost nothing in practice and the answer is exact regardless
       auto foreach = [&](auto f) { foreach_key(row, vlo, vhi, elo, ehi, f); };
       exact_ties(foreach, hist, suf, tie, cand, T, shift, n_gt, need, &s_bb, &s_below, &s_cnt);
     }
@@ -278,8 +256,6 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
 }
 
 template <bool IS_BF16, int STOP, int P>
-// keep_out / renormed_out are the Gate A stage tensors; nullptr on the production path, so the
-// gate measures the kernel's own arithmetic rather than a parallel copy of it
 __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
                                     int64_t* __restrict__ out, int splits, int K,
                                     float top_p, uint64_t seed, uint64_t offset,
@@ -298,17 +274,12 @@ __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
     return;
   }
 
-  // ascending sort, so rank r of the descending top-K sits at P-1-r
   const float m = fs::key_to_float<IS_BF16>(fs::unpack_key(buf[P - 1]));
   for (int i = t; i < K; i += blockDim.x) {
     w[i] = expf(fs::key_to_float<IS_BF16>(fs::unpack_key(buf[P - 1 - i])) - m);
   }
   __syncthreads();
 
-  // z stays a serial sum: the cut is bit-exact against reference.py only for this exact operand,
-  // and a block reduction would reassociate it. reference.py normalizes before taking the prefix,
-  // and a/z < p is not a < p*z in fp32, so the divides are per element -- spread over the block,
-  // which measured better than K of them in one thread at every k (9 rounds).
   if (t == 0) {
     float z = 0.0f;
     for (int i = 0; i < K; ++i) z += w[i];
@@ -336,7 +307,6 @@ __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
     const float zp = cum[r];
     uint64_t rs = seed, ro_ = offset;
     if (from_gen) {
-      // capture-safe: under a graph this reads the pointers the replay updates, not baked values
       const auto st = at::cuda::philox::unpack(philox);
       rs = std::get<0>(st);
       ro_ = std::get<1>(st);
@@ -371,7 +341,6 @@ __global__ void merge_ids_kernel(const uint64_t* __restrict__ partial, int64_t* 
     out[i] = static_cast<int64_t>(fs::unpack_idx(buf[P - 1 - i]));
 }
 
-// P is a template parameter of the merge, so the width is resolved here once per launch
 #define FS_MERGE_P_CASES(BODY)                                                                  \
   switch (P) {                                                                                  \
     case 32: BODY(32) break;                                                                    \
@@ -429,15 +398,10 @@ Plan make_plan(const torch::Tensor& logits, int64_t top_k, int64_t splits_overri
   const bool aligned =
       (reinterpret_cast<uintptr_t>(logits.data_ptr()) % 16 == 0) && (p.vocab % 8 == 0);
   p.n_vec = aligned ? p.vocab / 8 : 0;
-  // splits are bounded by the merge buffer and by how many blocks the batch already provides;
-  // the second bound comes from results/raw/kernel_floor.csv
-  // 2^shift-wide index buckets, at most 256 of them; the exact-tie bitmap is then 2^shift bits
   p.shift = 0;
   while ((p.vocab + (1 << p.shift) - 1) >> p.shift > 256) ++p.shift;
   TORCH_CHECK((1 << p.shift) <= TIE_CAP * 32, "vocabulary too large for the exact-tie bitmap");
   const int units = p.n_vec > 0 ? p.n_vec : p.vocab;
-  // measured: results/raw/kernel_splits.csv. the kernel is latency-bound on its phase chain,
-  // not throughput-bound, so more blocks stops paying well before the SMs are full
   const int autos = std::min(8, std::max(4, 128 / p.batch));
   p.splits = splits_override > 0 ? static_cast<int>(splits_override) : autos;
   p.splits = std::max(1, std::min({p.splits, MERGE_CAP / p.K, units}));
@@ -445,13 +409,11 @@ Plan make_plan(const torch::Tensor& logits, int64_t top_k, int64_t splits_overri
   return p;
 }
 
-}  // namespace
+}
 
 #undef SUF
 #undef FS_MERGE_P_CASES
 
-// offset < 0 means "draw from torch's default CUDA generator", which is the only form that
-// survives cuda-graph capture -- a host-side counter is baked into the graph at capture time
 static at::PhiloxCudaState philox_state(bool from_gen) {
   if (!from_gen) return at::PhiloxCudaState(0, 0);
   auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -493,7 +455,6 @@ torch::Tensor sample_fused(torch::Tensor logits, int64_t top_k, double top_p, in
   return out;
 }
 
-// debug entry point: the candidate set the kernel actually selected, for a Gate-A style check
 torch::Tensor topk_fused(torch::Tensor logits, int64_t top_k, int64_t splits_override) {
   const Plan p = make_plan(logits, top_k, splits_override);
   auto ids = torch::empty({p.batch, p.K}, logits.options().dtype(torch::kInt64));
@@ -509,8 +470,6 @@ torch::Tensor topk_fused(torch::Tensor logits, int64_t top_k, int64_t splits_ove
   return ids;
 }
 
-// ablation probe: run phases 1..phase of the pipeline and stop. differences between adjacent
-// phases give a measured cost breakdown, which is the only attribution available with ncu blocked.
 torch::Tensor probe_phase(torch::Tensor logits, int64_t top_k, double top_p, int64_t phase,
                           int64_t splits_override) {
   TORCH_CHECK(phase >= 1 && phase <= PARTIAL_ALL + MERGE_ALL, "phase must be in [1, ",
@@ -518,7 +477,6 @@ torch::Tensor probe_phase(torch::Tensor logits, int64_t top_k, double top_p, int
   const Plan p = make_plan(logits, top_k, splits_override);
   const bool is_bf16 = logits.scalar_type() == at::kBFloat16;
 
-  // both tensors are allocated at every phase so the allocator's cost is constant across the sweep
   auto out = torch::empty({p.batch}, logits.options().dtype(torch::kInt64));
   auto partial = torch::empty({p.batch, p.splits, p.K}, logits.options().dtype(torch::kInt64));
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -551,7 +509,6 @@ torch::Tensor probe_phase(torch::Tensor logits, int64_t top_k, double top_p, int
   return out;
 }
 
-// debug entry point: the Gate A stage tensors, straight out of the production merge kernel
 std::vector<torch::Tensor> stages_fused(torch::Tensor logits, int64_t top_k, double top_p,
                                         int64_t seed, int64_t offset, int64_t splits_override) {
   TORCH_CHECK(top_p > 0.0 && top_p <= 1.0, "top_p must be in (0, 1]");
@@ -604,7 +561,6 @@ static void merge_attr_rows(std::vector<AttrRow>& rows) {
   attr_row(rows, "merge_sample_kernel<fp16>", P, MERGE_BLOCK, merge_sample_kernel<false, MERGE_ALL, P>);
 }
 
-// debug: (name, P, block, regs, local bytes, static smem, max blocks/SM) for each production kernel
 std::vector<AttrRow> kernel_attrs() {
   std::vector<AttrRow> rows;
   attr_row(rows, "topk_partial_kernel", 0, BLOCK, topk_partial_kernel<PARTIAL_ALL>);
