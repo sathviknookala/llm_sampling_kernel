@@ -1,9 +1,0 @@
-CLAUDE.md
-__pycache__/
-*.py[cod]
-*.so
-build/
-.pytest_cache/
-*.egg-info/
-dist/
-.claude/
