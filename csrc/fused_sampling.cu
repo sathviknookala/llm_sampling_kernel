@@ -35,6 +35,28 @@ __device__ __forceinline__ void foreach_key(const uint16_t* __restrict__ row, in
   for (int i = elo + threadIdx.x; i < ehi; i += blockDim.x) f(i, fs::mono_key(row[i]));
 }
 
+__device__ __forceinline__ void fold_hist(uint32_t* hist) {
+  const int t = threadIdx.x;
+  uint32_t v = 0;
+  if (t < 256) {
+#pragma unroll
+    for (int q = 0; q < NSUB; ++q) v += hist[q * 256 + t];
+  }
+  __syncthreads();
+  if (t < 256) hist[t] = v;
+  __syncthreads();
+}
+
+__device__ __forceinline__ void find_boundary(const uint32_t* suf, int want, int above_base,
+                                              int* s_bucket, int* s_above) {
+  const int t = threadIdx.x;
+  if (t < 256 && SUF(t) >= static_cast<uint32_t>(want) &&
+      (t == 255 || SUF(t + 1) < static_cast<uint32_t>(want))) {
+    *s_bucket = t;
+    *s_above = above_base + ((t == 255) ? 0 : static_cast<int>(SUF(t + 1)));
+  }
+}
+
 template <typename F>
 __device__ __forceinline__ void exact_ties(F foreach, uint32_t* hist, uint32_t* suf, uint32_t* bm,
                                            uint64_t* cand, uint32_t T, int shift, int n_gt,
@@ -47,16 +69,7 @@ __device__ __forceinline__ void exact_ties(F foreach, uint32_t* hist, uint32_t* 
     if (k == T) atomicAdd(&hist[sub * 256 + (i >> shift)], 1u);
   });
   __syncthreads();
-  {
-    uint32_t v = 0;
-    if (t < 256) {
-#pragma unroll
-      for (int q = 0; q < NSUB; ++q) v += hist[q * 256 + t];
-    }
-    __syncthreads();
-    if (t < 256) hist[t] = v;
-  }
-  __syncthreads();
+  fold_hist(hist);
 
   fs::suffix_sum_256(hist, suf);
   const uint32_t total = SUF(0);
@@ -156,23 +169,10 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
     for (int i = t; i < K; i += BLOCK) out[i] = hist[(i & (NSUB - 1)) * 256 + i];
     return;
   }
-  {
-    uint32_t v = 0;
-    if (t < 256) {
-#pragma unroll
-      for (int q = 0; q < NSUB; ++q) v += hist[q * 256 + t];
-    }
-    __syncthreads();
-    if (t < 256) hist[t] = v;
-  }
-  __syncthreads();
+  fold_hist(hist);
 
   fs::suffix_sum_256(hist, suf);
-  if (t < 256 && SUF(t) >= static_cast<uint32_t>(keff) &&
-      (t == 255 || SUF(t + 1) < static_cast<uint32_t>(keff))) {
-    s_hb = t;
-    s_n_above = (t == 255) ? 0 : static_cast<int>(SUF(t + 1));
-  }
+  find_boundary(suf, keff, 0, &s_hb, &s_n_above);
   __syncthreads();
   const int hb = s_hb;
   const int n_above = s_n_above;
@@ -193,24 +193,11 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
     for (int i = t; i < K; i += BLOCK) out[i] = hist[(i & (NSUB - 1)) * 256 + i];
     return;
   }
-  {
-    uint32_t v = 0;
-    if (t < 256) {
-#pragma unroll
-      for (int q = 0; q < NSUB; ++q) v += hist[q * 256 + t];
-    }
-    __syncthreads();
-    if (t < 256) hist[t] = v;
-  }
-  __syncthreads();
+  fold_hist(hist);
 
   fs::suffix_sum_256(hist, suf);
   const int want = keff - n_above;
-  if (t < 256 && SUF(t) >= static_cast<uint32_t>(want) &&
-      (t == 255 || SUF(t + 1) < static_cast<uint32_t>(want))) {
-    s_lb = t;
-    s_n_gt = n_above + ((t == 255) ? 0 : static_cast<int>(SUF(t + 1)));
-  }
+  find_boundary(suf, want, n_above, &s_lb, &s_n_gt);
   if (t == 0) {
     s_n_out = 0;
     s_n_tie = 0;
