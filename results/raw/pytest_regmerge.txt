@@ -1,0 +1,15 @@
+# git: 6ddf1e0-dirty  so_mtime: 1790274722  2026-09-24T16:42:21-04:00
+........................................................................ [ 22%]
+........................................................................ [ 44%]
+....s.s................................................................. [ 67%]
+........................................................................ [ 89%]
+.................................                                        [100%]
+=============================== warnings summary ===============================
+../.venv_flashinfer/lib/python3.12/site-packages/flashinfer/cute_dsl/utils.py:86
+  /home/sathvik/.venv_flashinfer/lib/python3.12/site-packages/flashinfer/cute_dsl/utils.py:86: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [2] tests/test_hf_conformance.py:60: no tie-free rows in 256 torch.bfloat16 rows -- ties are the norm here
+319 passed, 2 skipped, 1 warning in 2.94s

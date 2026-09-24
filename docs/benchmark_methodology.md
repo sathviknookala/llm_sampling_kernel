@@ -166,7 +166,13 @@ python -m benchmarks.profile_stages                             # results/raw/st
 python -m benchmarks.amdahl_probe                               # results/raw/amdahl_probe.csv
 python -m benchmarks.summarize                                  # results/summary_ladder.md
 python -m benchmarks.tie_fidelity                               # results/raw/tie_fidelity.csv
+python -m benchmarks.kernel_trace                               # results/raw/kernel_trace.csv
+python -m benchmarks.kernel_attrs                               # results/raw/kernel_attrs.csv
+python -m benchmarks.sanitize                                   # results/raw/sanitizer.csv
 ```
+
+The fused-kernel sweeps (`spike_ladder*.csv`, `kernel_phases*.csv`) have their own commands in
+`results/SPIKE.md` § Reproduction.
 
 For the FlashInfer rungs, run with the venv interpreter and its `bin` on `PATH` (JIT needs `ninja`
 and `nvcc`):
@@ -185,7 +191,14 @@ PATH=~/.venv_flashinfer/bin:/home/sathvik/cuda-12.9/bin:$PATH \
 - **No `ncu` counters.** DRAM traffic is a computed floor from a measured copy bandwidth, not
   measured traffic. `ncu` is **confirmed blocked**, not merely unverified: `/proc/driver/nvidia/params`
   reports `RmProfilingAdminOnly: 1` and a non-root run returns `ERR_NVGPUCTRPERM`. The substitutes
-  that need no permission are the phase ablation above, `compute-sanitizer`, and `nvcc -Xptxas -v`.
+  that need no permission are the phase ablation above, `compute-sanitizer`, `nvcc -Xptxas -v`, a
+  CUPTI activity trace through `torch.profiler` (launch counts and per-kernel device time,
+  `kernel_trace.py`), and the CUDA occupancy API (theoretical occupancy, `kernel_attrs.py`).
+  Achieved occupancy and stall reasons have no substitute.
+- **`compute-sanitizer --tool initcheck` must run unfiltered.** With `--kernel-name` it stops
+  tracking writes by the unmatched (torch) kernels, so every torch-produced input reads as
+  uninitialized and the first flagged kernel aborts, poisoning the context for every later test.
+  `sanitize.py` filters racecheck only.
 - **A ~2.05 µs timing quantum at B≤8, reproducible and unexplained.** Cumulative phase timings land
   on near-exact integer multiples of it, so a ~2 µs step migrates between adjacent phases from
   round to round. Within-round rep spread is 0.0–0.1%, so it is not rep noise, and nine rounds do

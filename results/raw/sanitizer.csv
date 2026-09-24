@@ -1,0 +1,5 @@
+tool,kernels_checked,scope,tests_passed,tests_failed,tests_skipped,sanitizer_errors,hazards,clean,wall_s,log,git_commit
+memcheck,all,tests/test_fused_kernel.py,104,0,0,0,0,True,13.1,results/raw/sanitizer/memcheck.log,6ddf1e0-dirty
+racecheck,ours,tests/test_fused_kernel.py,104,0,0,0,0,True,297.2,results/raw/sanitizer/racecheck.log,6ddf1e0-dirty
+initcheck,all,tests/test_fused_kernel.py,104,0,0,0,0,True,6.9,results/raw/sanitizer/initcheck.log,6ddf1e0-dirty
+initcheck_positive_control,all,uninitialized logits,,,,379840,,True,25.6,results/raw/sanitizer/initcheck_control.log,6ddf1e0-dirty

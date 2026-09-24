@@ -2,9 +2,9 @@
 
 A custom CUDA implementation of decode-time **top-k + top-p sampling** for large-vocabulary LLMs. The kernel specializes the `[B, V] logits → [B] token ids` path for low decode batches and 128K–152K vocabularies, targeting the fixed-cost selection, sorting, and launch overhead left by general-purpose sampling implementations.
 
-On an **NVIDIA RTX PRO 4000 Blackwell (SM120)**, the current implementation runs **2.28×–4.09× faster than FlashInfer's `top_k_top_p_sampling_from_probs`** across the measured parameter grid. At the anchor configuration (`V=151936`, `k=50`, `p=0.90`, BF16, hot L2), latency falls from **75.4 µs to 22.5 µs at B=1**.
+On an **NVIDIA RTX PRO 4000 Blackwell (SM120)**, the current implementation runs **2.50×–5.12× faster than FlashInfer's `top_k_top_p_sampling_from_probs`** across the measured parameter grid. At the anchor configuration (`V=151936`, `k=50`, `p=0.90`, BF16, hot L2), latency falls from **72.8 µs to 19.1 µs at B=1 — 3.81×**, in **2 kernel launches** per sampling call (FlashInfer uses 9). Latencies are amortized over back-to-back calls; see *Timing*.
 
-Every number in this README comes from a committed artifact under `results/`, named at the point it is used. All performance measurements were taken at commit `df3e3c0`.
+Every number in this README comes from a committed artifact under `results/`, named at the point it is used. Current performance measurements are of the register-merge kernel (`*_regmerge` artifacts); the shared-memory bitonic kernel they replaced (commit `df3e3c0`) is kept alongside as the baseline.
 
 ## Project Objective
 
@@ -25,7 +25,7 @@ The operation is:
     → [B] token ids
 ```
 
-The original Hugging Face eager path performs much of this work over the full vocabulary and launches **64–70 CUDA kernels per sampling call** (`results/raw/launch_counts.csv`). A tighter PyTorch implementation and CUDA Graphs remove much of that overhead before any custom CUDA is written.
+The original Hugging Face eager path performs much of this work over the full vocabulary and issues **64–70 device operations per sampling call** — 47–51 kernels plus memcpy/memset (`results/raw/launch_counts.csv`, `results/raw/kernel_trace.csv`). A tighter PyTorch implementation and CUDA Graphs remove much of that overhead before any custom CUDA is written.
 
 For this reason, the primary performance baseline is not Hugging Face eager. It is:
 
@@ -36,7 +36,7 @@ top_k_top_p_sampling_from_probs
 
 The primary metric is **amortized device latency per sampling call in microseconds**.
 
-The current result is an **operator-level optimization**. Sampling accounts for only approximately 0.16–1.2% of the measured end-to-end decode step in the model probes in this repository (`results/raw/amdahl_probe.csv`), so the project does not claim a comparable end-to-end decode speedup.
+The current result is an **operator-level optimization**. Sampling accounts for only approximately 0.16–1.2% of the measured end-to-end decode step at B=1 in the model probes in this repository (`results/raw/amdahl_probe.csv`), so the project does not claim a comparable end-to-end decode speedup.
 
 ## Kernel Design
 
@@ -111,7 +111,7 @@ It performs:
 
 **No normalized probability tensor is materialized.** Scaling the uniform draw by the retained mass `Z_p` replaces renormalization and yields the identical categorical distribution.
 
-The merge that every measurement in this README was taken on is a shared-memory bitonic sort. A register-resident warp merge (`fs::warp_merge_sort`, one warp, `__shfl_xor_sync` across lanes) has since landed on the `register-merge` branch; it compiles without spill but **has not been tested or benchmarked**, and no number here reflects it.
+The merge is a register-resident warp sort (`fs::warp_merge_sort`): warp 0 of a 128-thread block holds all `splits × K` packed candidates in registers and bitonic-sorts them with `__shfl_xor_sync`, with **zero barriers inside the sort** (4 in the whole kernel, down from 49) and **zero spill at every width**. It replaced a shared-memory bitonic and cut the sort phase 21–74% across the 15 measured (B, k) cells (`results/raw/kernel_phase_breakdown_regmerge.csv` against `kernel_phase_breakdown.csv`; `results/SPIKE.md` §8.2).
 
 ### Numerical behavior
 
@@ -149,8 +149,9 @@ Several measurements shaped the design:
 - Replacing full-vocabulary processing with `torch.topk` captured much of the easy algorithmic gain before custom CUDA.
 - CUDA Graphs reduced host-launch overhead but left the underlying device work intact.
 - After implementing the fused CUDA path, phase ablation identified the **candidate merge** as the largest individual B=1 cost.
+- Moving the merge into one warp's registers made the whole kernel 7.5–22.2% faster at every measured hot cell. The three row traversals are now the largest cost at B=32 (72%) and at B=16 for k ≤ 50; at B ≤ 8 with k ≥ 50 the merge kernel still leads.
 
-More aggressive register-resident selection and a barrier-free merge remain optimization directions; they are not included in the measured headline result.
+Register-resident *selection* — collapsing the three row passes into one — remains the next optimization direction; it is not included in the measured result.
 
 ## Benchmark Methodology
 
@@ -170,7 +171,7 @@ The primary measurements were collected on:
 | Transformers | 5.12.1 |
 | Measured HBM copy bandwidth | ~553 GB/s |
 
-Captured per run in `results/raw/environment_spike.json`. The FlashInfer comparison is run in the same Python process and software environment as the custom kernel.
+Captured per run in `results/raw/environment_regmerge.json` (and `environment_spike.json` for the bitonic baseline). The FlashInfer comparison is run in the same Python process and software environment as the custom kernel.
 
 ### Target regime
 
@@ -244,7 +245,9 @@ Full methodology is documented in `docs/benchmark_methodology.md`.
 
 Across the complete measured parameter grid:
 
-**custom fused kernel: 2.28×–4.09× faster than `flashinfer_from_probs`**
+**custom fused kernel: 2.50×–5.12× faster than `flashinfer_from_probs`**
+
+The top of that range is the noisiest cell in the grid (B=1, V=128256, k=20, whose three rounds sit one ~2.05 µs timing quantum apart); the anchor below is the number to quote.
 
 At the anchor configuration:
 
@@ -256,13 +259,15 @@ dtype = BF16
 residency = hot
 ```
 
-| Batch | FlashInfer from probs | Fused kernel | Speedup |
-|---:|---:|---:|---:|
-| 1 | 75.4 µs | **22.5 µs** | **3.35×** |
-| 4 | 75.4 µs | **22.5 µs** | **3.35×** |
-| 8 | 75.5 µs | **22.6 µs** | **3.35×** |
-| 16 | 75.4 µs | **26.6 µs** | **2.83×** |
-| 32 | 101.2 µs | **34.8 µs** | **2.91×** |
+| Batch | FlashInfer from probs | Fused kernel | Speedup | Bitonic merge (`df3e3c0`) |
+|---:|---:|---:|---:|---:|
+| 1 | 72.8 µs | **19.1 µs** | **3.81×** | 22.5 µs (3.35×) |
+| 4 | 73.8 µs | **19.7 µs** | **3.74×** | 22.5 µs (3.35×) |
+| 8 | 74.3 µs | **20.3 µs** | **3.66×** | 22.6 µs (3.35×) |
+| 16 | 74.3 µs | **24.6 µs** | **3.02×** | 26.6 µs (2.83×) |
+| 32 | 101.2 µs | **30.7 µs** | **3.29×** | 34.8 µs (2.91×) |
+
+Each speedup divides by FlashInfer measured in the same sweep; FlashInfer itself read 1.5% faster (median) in the register-merge sweep than in the bitonic one.
 
 The low-batch latency remains almost flat through B=8 despite an 8× increase in total input work, consistent with the measured latency-bound behavior of this regime.
 
@@ -272,18 +277,42 @@ For `V=151936`, BF16, hot L2:
 
 | Configuration | Fused kernel | Speedup vs FlashInfer |
 |---|---:|---:|
-| B=1, k=20 | **20.3 µs** | **3.69×** |
-| B=1, k=50 | **22.5 µs** | **3.35×** |
-| B=1, k=100 | **30.3 µs** | **2.48×** |
-| B=32, k=20 | **30.7 µs** | **3.35×** |
-| B=32, k=50 | **34.8 µs** | **2.91×** |
-| B=32, k=100 | **38.3 µs** | **2.69×** |
+| B=1, k=20 | **16.3 µs** | **4.49×** |
+| B=1, k=50 | **19.1 µs** | **3.81×** |
+| B=1, k=100 | **24.1 µs** | **3.04×** |
+| B=32, k=20 | **27.0 µs** | **3.81×** |
+| B=32, k=50 | **30.7 µs** | **3.29×** |
+| B=32, k=100 | **34.9 µs** | **2.95×** |
 
-FP16 and BF16 were measured against each other at `V=151936`, `k=50`, `p=0.90`: they agree to within 0.1% at B ≤ 8 hot, and the widest divergence across those ten cells is 7.8% (B=1, cold L2), inside this rung's round-to-round spread.
+FP16 and BF16 were measured against each other at `V=151936`, `k=50`, `p=0.90`: they agree to within 0.7–1.2% at hot B ∈ {1, 4, 8, 32}, and the widest divergence across those ten cells is 9.8% (B=1, cold L2), inside this rung's round-to-round spread.
 
-Cold-L2 measurements reduce the advantage, with measured speedups of approximately **2.53×–3.37×**.
+Cold-L2 measurements reduce the advantage, with measured speedups of **2.70×–3.95×**.
 
-Full measurements are stored in `results/raw/spike_ladder.csv` (1134 rows).
+Full measurements are stored in `results/raw/spike_ladder_regmerge.csv` (1134 rows); the bitonic baseline is `results/raw/spike_ladder.csv`.
+
+### Launches and kernel resources
+
+`results/raw/kernel_trace.csv` — a CUPTI activity trace via `torch.profiler`, bf16 anchor, 50 steps:
+
+| Path | B=1 | B=32 |
+|---|---:|---:|
+| **fused kernel** | **2 kernels**, 0 memcpy/memset, 17.8 µs device | **2 kernels**, 0 memcpy/memset, 28.0 µs device |
+| `flashinfer_from_probs` | 9 kernels, 36.4 µs device | 9 kernels, 95.8 µs device |
+| Hugging Face eager | 47 kernels + 17 memcpy/memset, 242.3 µs device | 51 kernels + 19 memcpy/memset, 2001.1 µs device |
+
+Device time is the sum of kernel durations, so it excludes launch gaps and sits below the ladder latency. At B=1 the fused path's 17.8 µs splits 9.5 µs `topk_partial_kernel` / 8.4 µs `merge_sample_kernel`; at B=32 it is 21.6 / 6.4 µs.
+
+`results/raw/kernel_attrs.csv` — `cudaFuncGetAttributes` and the CUDA occupancy API at the shipped launch configuration (the figure Nsight Compute reports as *theoretical occupancy*):
+
+| Kernel | Block | Registers | Spill (local) | Static shared | Blocks/SM | Theoretical occupancy |
+|---|---:|---:|---:|---:|---:|---:|
+| `topk_partial_kernel` | 512 | 38 | **0 B** | 18.0 KB | 3 | **100%** |
+| `merge_sample_kernel`, P=128 (B=32, k=20) | 128 | 48 | **0 B** | 2.0 KB | 10 | 83.3% |
+| `merge_sample_kernel`, P=256 (k=20 at B ≤ 16; B=32, k=50) | 128 | 88 | **0 B** | 3.0 KB | 5 | 41.7% |
+| `merge_sample_kernel`, P=512 (k=50 at B ≤ 16; B=32, k=100) | 128 | 130 | **0 B** | 5.0 KB | 3 | 25.0% |
+| `merge_sample_kernel`, P=1024 (k=100, B ≤ 16) | 128 | 142 | **0 B** | 9.0 KB | 3 | 25.0% |
+
+All 13 instantiations spill nothing — the 9 the measured grid dispatches, plus P=32 and P=64. The merge is register-limited by design — the candidates *are* the registers — and at B ≤ 16 its grid is B blocks on a 70-SM GPU, so no SM hosts a second block and its occupancy does not bind.
 
 ## Why the Kernel Is Faster
 
@@ -319,23 +348,23 @@ Merge, softmax, cumulative probability, top-p cutoff, and the random draw are ha
 
 ### Measured remaining bottleneck
 
-Phase ablation at B=1, `V=151936`, `k=50` (`results/raw/kernel_phase_breakdown.csv`, derived from 9 rounds in `results/raw/kernel_phases.csv`) attributes the 22.5 µs total approximately as:
+Phase ablation at B=1, `V=151936`, `k=50` (`results/raw/kernel_phase_breakdown_regmerge.csv`, derived from 9 rounds in `results/raw/kernel_phases_regmerge.csv`) attributes the 18.5 µs total approximately as, with the bitonic kernel alongside. The ablation is its own instrument and reads 0.6 µs below the ladder's 19.1 µs; its `full` control (`sample_fused` timed alongside) agrees with the last phase.
 
-| Component | Latency | Share |
-|---|---:|---:|
-| dispatch floor | 2.51 µs | 11% |
-| high-byte histogram | 1.62 µs | 7% |
-| high-byte search | 0.06 µs | <1% |
-| low-byte histogram | 2.27 µs | 10% |
-| threshold search | 0.15 µs | 1% |
-| gather + tie resolution | 3.68 µs | 16% |
-| candidate bitonic merge | **8.12 µs** | **36%** |
-| softmax + top-p + draw | 4.09 µs | 18% |
-| **Total** | **22.51 µs** | |
+| Component | Latency | Share | Bitonic (`df3e3c0`) |
+|---|---:|---:|---:|
+| dispatch floor | 2.54 µs | 14% | 2.51 µs |
+| high-byte histogram | 1.61 µs | 9% | 1.62 µs |
+| high-byte search | 0.06 µs | <1% | 0.06 µs |
+| low-byte histogram | 2.12 µs | 11% | 2.27 µs |
+| threshold search | 0.28 µs | 2% | 0.15 µs |
+| gather + tie resolution | 3.67 µs | 20% | 3.68 µs |
+| candidate merge sort | **6.10 µs** | **33%** | 8.12 µs |
+| softmax + top-p + draw | 2.09 µs | 11% | 4.09 µs |
+| **Total** | **18.46 µs** | | 22.51 µs |
 
-The candidate merge is therefore the largest measured low-batch optimization target. For scale, `results/raw/kernel_floor.csv` puts one full pass over the vocabulary at **4.49 µs** at B=1, so the kernel is 5.0× above its own floor.
+The merge kernel (last two rows together) fell from 12.21 to 8.19 µs; the partial kernel is unchanged, as it should be. At B=32 the three row traversals are now **72%** of the kernel, so register-resident selection is the next target there; at B=1 the merge kernel (44%) and the traversals (40%) are roughly even. For scale, `results/raw/kernel_floor.csv` puts one full pass over the vocabulary at **4.49 µs** at B=1, so the kernel is 4.3× above its own floor.
 
-Because `ncu` is unavailable on this machine, this attribution is a wall-clock phase ablation — phases 1..n of the real kernel are run and the kernel then stops — not a hardware-counter profile. Individual sub-2 µs phase deltas at B ≤ 8 are not resolvable; a ~2.05 µs timing quantum migrates between adjacent phases across rounds.
+Because `ncu` is unavailable on this machine, this attribution is a wall-clock phase ablation — phases 1..n of the real kernel are run and the kernel then stops — not a hardware-counter profile. Individual sub-2 µs phase deltas at B ≤ 8 are not resolvable; a ~2.05 µs timing quantum migrates between adjacent phases across rounds — the softmax-tail row above moved by exactly one quantum, so only the merge kernel's total is resolvable at B=1.
 
 ## Repository Structure
 
@@ -360,6 +389,9 @@ Because `ncu` is unavailable on this machine, this attribution is a wall-clock p
 │   ├── kernel_phases.py        # cumulative kernel phase ablation
 │   ├── profile_stages.py       # framework-stage attribution
 │   ├── launch_counts.py        # kernels launched per sampling call
+│   ├── kernel_trace.py         # CUPTI per-kernel trace: launches + device time
+│   ├── kernel_attrs.py         # registers, spills, shared memory, occupancy
+│   ├── sanitize.py             # compute-sanitizer memcheck/racecheck/initcheck
 │   ├── amdahl_probe.py         # sampling vs complete decode step
 │   ├── tie_fidelity.py         # low-precision semantic fidelity
 │   └── summarize.py            # benchmark summaries
@@ -374,7 +406,8 @@ Because `ncu` is unavailable on this machine, this attribution is a wall-clock p
 │   ├── raw/                    # complete benchmark CSV/JSON artifacts
 │   ├── DECISION.md             # baseline investigation / go-no-go
 │   ├── SPIKE.md                # fused-kernel result and ablations
-│   ├── summary_spike.md        # summarized fused-kernel ladder
+│   ├── summary_regmerge.md     # summarized fused-kernel ladder (register merge)
+│   ├── summary_spike.md        # summarized fused-kernel ladder (bitonic baseline)
 │   └── summary_ladder.md       # summarized pre-kernel ladder
 │
 ├── docs/
@@ -413,7 +446,9 @@ $V -m benchmarks.kernel_floor
 Run the phase ablation:
 
 ```bash
-$V -m benchmarks.kernel_phases --rounds 9
+$V -m benchmarks.kernel_phases --rounds 9 \
+    --out results/raw/kernel_phases_regmerge.csv \
+    --breakdown-out results/raw/kernel_phase_breakdown_regmerge.csv
 ```
 
 Run the primary benchmark:
@@ -422,29 +457,44 @@ Run the primary benchmark:
 $V -m benchmarks.benchmark_sampling \
     --rounds 3 \
     --reps 5 \
-    --out results/raw/spike_ladder.csv \
-    --env-out results/raw/environment_spike.json
+    --out results/raw/spike_ladder_regmerge.csv \
+    --env-out results/raw/environment_regmerge.json
 ```
 
 Generate the summary:
 
 ```bash
 $V -m benchmarks.summarize \
-    --raw results/raw/spike_ladder.csv \
-    --out results/summary_spike.md
+    --raw results/raw/spike_ladder_regmerge.csv \
+    --out results/summary_regmerge.md
+```
+
+Trace launches, read kernel resources, and run the sanitizers:
+
+```bash
+$V -m benchmarks.kernel_trace
+$V -m benchmarks.kernel_attrs
+$V -m benchmarks.sanitize
 ```
 
 Primary outputs:
 
 ```text
-results/raw/spike_ladder.csv
-results/raw/environment_spike.json
+results/raw/spike_ladder_regmerge.csv
+results/raw/environment_regmerge.json
+results/raw/kernel_phases_regmerge.csv
+results/raw/kernel_phase_breakdown_regmerge.csv
+results/raw/kernel_trace.csv
+results/raw/kernel_attrs.csv
+results/raw/sanitizer.csv
 results/raw/kernel_floor.csv
 results/raw/kernel_splits.csv
-results/raw/kernel_phases.csv
-results/raw/kernel_phase_breakdown.csv
-results/summary_spike.md
+results/summary_regmerge.md
 ```
+
+The bitonic baseline (`spike_ladder.csv`, `kernel_phases.csv`, `kernel_phase_breakdown.csv`, `environment_spike.json`, `summary_spike.md`) came from the same commands with their default or `_spike` output names at `df3e3c0`.
+
+Artifacts record `git_commit` as `6ddf1e0-dirty` (register merge) and `df3e3c0-dirty` (bitonic): in both cases the dirty state is uncommitted measurement scripts and, for the register merge, the additive `kernel_attrs()` debug binding — no kernel source differs from the named commit.
 
 A `.so` built here is not portable across PyTorch minor versions — rebuild in the environment you intend to benchmark in.
 
@@ -468,7 +518,7 @@ Current Gate A coverage includes:
 - deterministic explicit seed/offset behavior,
 - RNG advancement under CUDA Graph replay.
 
-The validation set reported, at commit `df3e3c0` (`results/SPIKE.md` §4):
+The validation set reported (`results/SPIKE.md` §4), on the bitonic kernel at `df3e3c0` and again, unchanged, on the register merge:
 
 ```text
 top-p keep mask:
@@ -482,7 +532,14 @@ test bound = 64 ULP
 test suite:
 319 passed
 2 skipped
+
+compute-sanitizer, 104 kernel tests (results/raw/sanitizer.csv):
+memcheck   0 errors
+racecheck  0 hazards
+initcheck  0 errors
 ```
+
+initcheck runs unfiltered: restricting it to this repo's kernels with `--kernel-name` stops it tracking writes by PyTorch's kernels, so every input tensor reads as uninitialized. A deliberately uninitialized `torch.empty` input confirms it still catches a real uninitialized read in `topk_partial_kernel` (the `initcheck_positive_control` row). The test-suite log is `results/raw/pytest_regmerge.txt`.
 
 Each claim is falsified as well as asserted: inverting the index half of the packed key fails 32 tests, forcing the old clamped tie path fails 4, relaxing the strict `<` at the cut fails 8, and restoring a host-side RNG counter fails the graph-replay test.
 
@@ -500,29 +557,31 @@ Gate B — the separate FP32 semantic-fidelity comparison defined in `benchmarks
 - PyTorch extension bindings,
 - CUDA Graph-safe RNG behavior,
 - Gate A correctness suite,
+- sanitizer-clean under memcheck, racecheck and initcheck,
 - benchmark ladder and phase attribution.
 
 ### Measured
 
-- **2.28×–4.09×** speedup over `flashinfer_from_probs` across the tested grid,
-- **22.5 µs** anchor B=1 latency,
-- **34.8 µs** anchor B=32 latency,
+- **2.50×–5.12×** speedup over `flashinfer_from_probs` across the tested grid (**3.81×** at the anchor),
+- **19.1 µs** anchor B=1 latency (22.5 µs with the bitonic merge),
+- **30.7 µs** anchor B=32 latency (34.8 µs),
+- **2 kernel launches** per sampling call, against 9 for FlashInfer and 64–70 device operations for Hugging Face eager,
+- **0 bytes of spill** in every production kernel instantiation; 100% theoretical occupancy for the selection kernel,
 - kernel floor and split-count sweeps,
 - internal phase attribution,
 - hot/cold L2 sensitivity.
 
 ### Experimental / future work
 
-- make the row-split rule depend on `k` as well as batch size — at B=1, k=20 the rule picks 8 splits (19.96 µs) where 20 splits measures 16.40 µs, 21.7% faster (`results/raw/kernel_splits.csv`),
-- validate and measure the register-resident warp merge now on the `register-merge` branch, which replaces the shared-memory bitonic but has not been run,
-- investigate single-pass register-resident selection to reduce the three vocabulary traversals,
+- make the row-split rule depend on `k` as well as batch size — on the bitonic kernel, at B=1, k=20 the rule picked 8 splits (19.96 µs) where 20 splits measured 16.40 µs, 21.7% faster (`results/raw/kernel_splits.csv`); the register merge changed the merge cost that trade balances against, so it must be re-measured,
+- investigate single-pass register-resident selection to reduce the three vocabulary traversals, now 40% of the kernel at B=1 and 72% at B=32,
 - complete Gate B semantic fidelity.
 
 ### Measurement limitations
 
-- GPU clocks could not be locked; every row records `clocks_locked=false`. Median round-to-round spread is 0.2–0.5% per rung, but the fused-kernel rung's worst case is 18%.
-- Nsight Compute hardware counters are unavailable because profiling requires administrator permission (`RmProfilingAdminOnly: 1`), so all attribution is wall-clock.
-- Timings are amortized across repeated calls and therefore understate dependent-call launch latency.
+- GPU clocks could not be locked; every row records `clocks_locked=false`. The fused-kernel rung's round-to-round spread, (max − min) / median, is 1.3% median but 25.7% worst case, against 1.0% worst case for `flashinfer_from_probs` (`results/raw/spike_ladder_regmerge.csv`; 18.0% worst case on the bitonic sweep).
+- Nsight Compute hardware counters are unavailable because profiling requires administrator permission (`RmProfilingAdminOnly: 1`), so all attribution is wall-clock. The unprivileged substitutes used instead are a CUPTI activity trace (launch counts, per-kernel device time), the CUDA occupancy API (theoretical occupancy), and `compute-sanitizer`; achieved occupancy and stall reasons remain unmeasured.
+- Timings are amortized across repeated calls and therefore understate dependent-call launch latency. The fused kernel issues 2 launches per call and `flashinfer_from_probs` 9; the net bias between them is not measured.
 - Input logits are synthetic Gaussian samples rather than logits captured from real models; the tie-fidelity result in particular should be re-run against a real logits capture.
 - FlashInfer has different sampling semantics and is used only as a performance comparison.
 - The measured improvement is an operator-level result, not a material end-to-end LLM decode speedup.

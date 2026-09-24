@@ -197,37 +197,32 @@ A speedup against HF eager is not a result: `tight_eager`, ordinary eager PyTorc
 
 ## Current Focus
 
-**The kernel is Gate A certified and beats the bar.** `csrc/fused_sampling.cu` runs the whole
-operation -- `[B, V]` logits to one token id -- in **22.5 us at B=1**, against **75.4 us** for
-`flashinfer_from_probs` measured in the same process (`results/raw/spike_ladder.csv`, 1134 rows).
-Across the grid the win is **2.28x-4.09x**. 319 tests + 2 skipped.
-**Read `results/SPIKE.md` before touching `csrc/`.**
+**A register-resident warp merge has landed UNMEASURED and UNTESTED, and that is the first thing
+to fix.** `fs::warp_merge_sort` (`csrc/fused_sampling.cuh`) replaces the shared-memory bitonic:
+one warp, candidates in registers, `__shfl_xor_sync` across lanes, zero barriers inside the sort.
+It **compiles clean with no spill at any width** and the build-side numbers are in `SPIKE.md` §8.2
+-- but **nothing has been run**: no pytest, no ladder, no ablation. The GPU was occupied by an
+unrelated RL job for the whole session. **Do not quote a speedup for it and do not trust it until
+`pytest` passes.**
 
-**It is deliberately slower than the first spike, and that is the headline to explain.** At commit
-`33802d7` it was 20.6 us / 3.59x. Closing Gate A cost ~9% at k=50 and ~19% at k=100: the cut now
-normalizes before taking the prefix exactly as `reference.py` does, which is K per-element
-divisions the old `cum[i-1] >= top_p * z` form never paid. Quote **3.35x**, and never the 3.59x
-still sitting in git history.
-
-Gate status: **Gate A closed** -- `topk_ids` exact, ties exact at any multiplicity (no clamp),
-`keep` 0 mismatches over 195 840 elements across 54 configurations, `renormed` 15 ulp (cannot be
-bitwise; torch scans the prefix, the kernel sums it serially). **Gate B has still not been run.**
-
-Where the 22.5 us goes, measured not inferred (`results/raw/kernel_phase_breakdown.csv`): at B=1
-the merge kernel is 54% (bitonic sort 36%, sampling tail 18%), the three row passes 34%, the two
-boundary searches 0.9%. At B=32 it inverts -- traversals 63%, merge 29%.
+Every performance number in `results/` still describes the *previous* merge at `df3e3c0`. The
+kernel there is **22.5 us at B=1** against **75.4 us** for `flashinfer_from_probs`
+(`results/raw/spike_ladder.csv`, 1134 rows), **2.28x-4.09x** across the grid. Quote **3.35x**.
 
 Next, in order:
 
-0. **Refit the split rule on `k`, not just `B`** -- `clamp(128/B, 4, 8)` is right at k=50/100 and
-   at B=32, and wrong at k=20: 20 splits gives 16.40 us at B=1 against the rule's 19.96 (+21.7%),
-   16 splits gives 18.56 at B=8 (+10.3%). `results/raw/kernel_splits.csv`. Cheapest win available
-1. **A barrier-free merge.** 0.18 us per bitonic stage is barrier and shared round-trip, not
-   arithmetic. One warp, registers, `__shfl_xor` with a cyclic layout: every `j >= 32` stage is
-   local, every `j < 32` stage is one shuffle, no `__syncthreads` at all
-2. **Run Gate B** -- the fp32 fidelity gate, the only gate still not run
-3. Collapse the three row passes into one register-resident warp select -- 34% at B=1, 63% at B=32
-4. Re-measure and decide whether `DECISION.md` §6's 5-20x is reachable or should be retired
+0. **Build and run the gate.** `python setup.py build_ext --inplace` then `pytest tests/ -q`;
+   321 tests collect, 319 passed + 2 skipped before this change. Nothing else matters until this
+   is green
+1. **Measure the register merge** -- `benchmarks.kernel_phases` for phase 6, then the full ladder.
+   The block-size change (`MERGE_BLOCK` 1024 -> 128) is confounded with it and must be reported as
+   one result. If phase 6 does not fall, suspect the 236 KB / 451 KB straight-line SASS footprint
+   first; the fix is to re-roll the 15 cross-lane stages, which do not need compile-time indices
+2. **Refit the split rule on `k`, not just `B`** -- `clamp(128/B, 4, 8)` is wrong at k=20: 20
+   splits gives 16.40 us at B=1 against 19.96 (+21.7%). `results/raw/kernel_splits.csv`
+3. **Run Gate B** -- the fp32 fidelity gate, the only gate still not run
+4. Collapse the three row passes into one register-resident warp select -- 34% at B=1, 63% at
+   B=32. This is Phase 2 of the register plan and is explicitly gated on Phase 1 measuring well
 
 **Do not re-attempt these three** -- implemented, measured, reverted, written up in `SPIKE.md` §7:
 pair-indexing the bitonic stages (neutral); sorted runs per split with the merge resuming at `2R`
@@ -235,25 +230,23 @@ pair-indexing the bitonic stages (neutral); sorted runs per split with the merge
 
 ## Last Session
 
-**Session 9 -- Gate A closed, and two bugs that only existed off the measured path.** Six commits.
+**Session 10 -- the register merge, written and compiled but never run.** The GPU was busy with an
+unrelated RL job start to finish, so this session produced code and build-side evidence only.
 
-- **The tie clamp is gone.** `TIE_CAP` silently emitted an arbitrary tied id past 2048 per split.
-  The fallback buckets the index, then uses a bitmap over the boundary bucket whose capacity is a
-  *proof* -- the bucket is `2^shift` wide. It runs only when the buffer would clamp, which real
-  logits never reach (max multiplicity 14 in `tie_fidelity.csv`), so it costs nothing
-- **Graph capture froze the RNG.** The offset came from a host `itertools.count()`, so five
-  replays of a captured `sample_fused` returned `[1459, 2865, 3518, 2598]` every time. Invisible
-  to the whole eager ladder, wrong in exactly the deployment mode the project targets. Now
-  `PhiloxCudaState`, as dropout does it
-- **Gate A cost 9-19% and it was worth paying.** `a/z < p` is not `a < p*z` in fp32, so matching
-  `reference.py` meant K per-element divides. Visible directly in the ablation -- phase 7 went
-  2.06 -> 4.09 us
-- **Three optimizations measured as non-results and were reverted.** The instructive one: sorted
-  runs per split cut merge stages 18-52% and moved total time not at all -- on a latency-bound
-  dependent chain the stages relocate rather than disappear
-- **Three rounds is not enough to tune at B=1.** A K-conditional path was built on a 3-round
-  reading that 9 rounds reversed. The ~2.05 us quantum is larger than most of what is being
-  compared there
+- **`fs::warp_merge_sort` replaces the shared bitonic.** Warp 0 holds all `P` packed candidates in
+  registers and sorts them with `__shfl_xor_sync`. `P` is now a template parameter dispatched over
+  {32,64,128,256,512,1024}; `merge_sample_kernel` and `merge_ids_kernel` are templated on it
+- **The layout is blocked, not the cyclic one `SPIKE.md` §8 sketched.** Bitonic's inner loop runs
+  `j = k/2 … 1`, so small `j` is the common case; blocked makes exactly those stages
+  register-local. SASS confirms 15 cross-lane stages at every `P` against cyclic's 35 at P=512
+- **No spill at any width, and the block-size change is forced, not chosen.** 0 spill bytes
+  everywhere; 130 registers at P=512 against a 1024-thread block's 64-register cap is why
+  `MERGE_BLOCK` had to drop 1024 -> 128. Barriers 49 -> 4, independent of `P`
+- **The trade is a 9-17x instruction footprint** -- 236 KB of straight-line SASS at k=50, 451 KB
+  at k=100. Recorded as the first suspect if the merge does not get faster
+- **Three stale `MERGE_BLOCK` claims corrected.** `SPIKE.md` said 512 and `<<<B, 512>>>`; `643d369`
+  set 512 and `df3e3c0` put it back to 1024, which is what every committed artifact was measured
+  on. The artifacts were right; the prose was wrong
 
 ## Known Issues
 

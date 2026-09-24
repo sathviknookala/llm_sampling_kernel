@@ -122,4 +122,98 @@ __device__ __forceinline__ void suffix_sum_256(const uint32_t* hist, uint32_t* s
   __syncthreads();
 }
 
+
+// one warp, candidates in registers, no barriers. blocked layout -- lane L owns [L*R, L*R+R) --
+// so the frequent small-j stages are register-local and only j >= R costs a shuffle; a cyclic
+// layout inverts that and pays 35 shuffle stages at P=512 where this pays 15.
+// every register index is a template parameter, so nothing here can lower to local memory.
+namespace regsort {
+
+template <int R, int K_, int J, int S>
+struct Local {
+  __device__ __forceinline__ static void run(uint64_t (&v)[R], int base) {
+    constexpr int SJ = S ^ J;
+    if constexpr (SJ > S) {
+      const bool up = (((base + S) & K_) == 0);
+      const uint64_t a = v[S], b = v[SJ];
+      if ((a > b) == up) {
+        v[S] = b;
+        v[SJ] = a;
+      }
+    }
+    Local<R, K_, J, S + 1>::run(v, base);
+  }
+};
+template <int R, int K_, int J>
+struct Local<R, K_, J, R> {
+  __device__ __forceinline__ static void run(uint64_t (&)[R], int) {}
+};
+
+// J >= R, and J is a power of two, so i ^ J only flips lane bits: the partner is lane ^ (J/R)
+// at the same slot
+template <int R, int K_, int J, int S>
+struct Cross {
+  __device__ __forceinline__ static void run(uint64_t (&v)[R], int base) {
+    const int i = base + S;
+    const uint64_t o = __shfl_xor_sync(0xFFFFFFFFu, v[S], J / R);
+    const bool take_max = (((i & J) != 0) == ((i & K_) == 0));
+    v[S] = take_max ? (o > v[S] ? o : v[S]) : (o < v[S] ? o : v[S]);
+    Cross<R, K_, J, S + 1>::run(v, base);
+  }
+};
+template <int R, int K_, int J>
+struct Cross<R, K_, J, R> {
+  __device__ __forceinline__ static void run(uint64_t (&)[R], int) {}
+};
+
+template <int R, int K_, int J>
+struct Stage {
+  __device__ __forceinline__ static void run(uint64_t (&v)[R], int base) {
+    if constexpr (J < R) {
+      Local<R, K_, J, 0>::run(v, base);
+    } else {
+      Cross<R, K_, J, 0>::run(v, base);
+    }
+    Stage<R, K_, (J >> 1)>::run(v, base);
+  }
+};
+template <int R, int K_>
+struct Stage<R, K_, 0> {
+  __device__ __forceinline__ static void run(uint64_t (&)[R], int) {}
+};
+
+template <int R, int K_>
+struct Level {
+  __device__ __forceinline__ static void run(uint64_t (&v)[R], int base) {
+    Level<R, (K_ >> 1)>::run(v, base);
+    Stage<R, K_, (K_ >> 1)>::run(v, base);
+  }
+};
+template <int R>
+struct Level<R, 1> {
+  __device__ __forceinline__ static void run(uint64_t (&)[R], int) {}
+};
+
+}  // namespace regsort
+
+// ascending sort of P packed candidates by warp 0. padding with 0 sorts below every real packed
+// value. only the top K are stored: every reader indexes buf[P-1-i] for i < K.
+template <int P>
+__device__ __forceinline__ void warp_merge_sort(const uint64_t* __restrict__ src, uint64_t* buf,
+                                                int n, int K) {
+  constexpr int R = P / 32;
+  if (threadIdx.x < 32) {
+    const int base = static_cast<int>(threadIdx.x) * R;
+    uint64_t v[R];
+#pragma unroll
+    for (int s = 0; s < R; ++s) v[s] = (base + s < n) ? src[base + s] : 0ull;
+    regsort::Level<R, P>::run(v, base);
+#pragma unroll
+    for (int s = 0; s < R; ++s) {
+      if (base + s >= P - K) buf[base + s] = v[s];
+    }
+  }
+  __syncthreads();
+}
+
 }  // namespace fs

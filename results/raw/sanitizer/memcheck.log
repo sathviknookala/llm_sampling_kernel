@@ -1,0 +1,7 @@
+/home/sathvik/cuda-12.9/bin/compute-sanitizer --tool memcheck --print-limit 100 /home/sathvik/.venv_flashinfer/bin/python -m pytest tests/test_fused_kernel.py -q -p no:cacheprovider
+
+========= COMPUTE-SANITIZER
+........................................................................ [ 69%]
+................................                                         [100%]
+104 passed in 12.52s
+========= ERROR SUMMARY: 0 errors

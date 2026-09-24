@@ -17,7 +17,7 @@ setup(
                 "cxx": ["-O3", "-std=c++17"],
                 # no --use_fast_math: Gate A compares renormalized probabilities against an
                 # fp32 reference, and __expf would put the kernel out of reach of that
-                "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
+                "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo", "-Xptxas=-v"],
             },
         )
     ],

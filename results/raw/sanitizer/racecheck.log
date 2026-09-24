@@ -1,0 +1,7 @@
+/home/sathvik/cuda-12.9/bin/compute-sanitizer --tool racecheck --racecheck-report all --kernel-name kns=topk_partial_kernel --kernel-name kns=merge_sample_kernel --kernel-name kns=merge_ids_kernel --print-limit 100 /home/sathvik/.venv_flashinfer/bin/python -m pytest tests/test_fused_kernel.py -q -p no:cacheprovider
+
+========= COMPUTE-SANITIZER
+........................................................................ [ 69%]
+................................                                         [100%]
+104 passed in 296.48s (0:04:56)
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)

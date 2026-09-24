@@ -1,0 +1,106 @@
+batch,top_k,phase,label,cumulative_us,delta_us,pct_of_total
+1,20,1,high-byte histogram,4.141,1.614,9.9
+1,20,2,+ bucket search,4.21,0.069,0.4
+1,20,3,+ low-byte histogram,6.33,2.12,13.0
+1,20,4,+ exact threshold,6.601,0.271,1.7
+1,20,5,"+ gather, ties, store",10.252,3.651,22.3
+1,20,6,+ merge sort,14.353,4.101,25.1
+1,20,7,"+ softmax, cut, draw",16.345,1.992,12.2
+1,50,1,high-byte histogram,4.141,1.606,8.7
+1,50,2,+ bucket search,4.2,0.059,0.3
+1,50,3,+ low-byte histogram,6.318,2.118,11.5
+1,50,4,+ exact threshold,6.596,0.278,1.5
+1,50,5,"+ gather, ties, store",10.27,3.674,19.9
+1,50,6,+ merge sort,16.373,6.103,33.1
+1,50,7,"+ softmax, cut, draw",18.459,2.086,11.3
+1,100,1,high-byte histogram,4.143,1.602,7.1
+1,100,2,+ bucket search,4.202,0.059,0.3
+1,100,3,+ low-byte histogram,6.33,2.128,9.4
+1,100,4,+ exact threshold,6.598,0.268,1.2
+1,100,5,"+ gather, ties, store",10.349,3.751,16.6
+1,100,6,+ merge sort,18.464,8.115,36.0
+1,100,7,"+ softmax, cut, draw",22.564,4.1,18.2
+4,20,1,high-byte histogram,4.143,1.607,9.8
+4,20,2,+ bucket search,4.25,0.107,0.7
+4,20,3,+ low-byte histogram,6.586,2.336,14.3
+4,20,4,+ exact threshold,7.755,1.169,7.1
+4,20,5,"+ gather, ties, store",10.266,2.511,15.3
+4,20,6,+ merge sort,14.383,4.117,25.1
+4,20,7,"+ softmax, cut, draw",16.375,1.992,12.2
+4,50,1,high-byte histogram,4.146,1.61,8.6
+4,50,2,+ bucket search,4.242,0.096,0.5
+4,50,3,+ low-byte histogram,6.586,2.344,12.6
+4,50,4,+ exact threshold,7.82,1.234,6.6
+4,50,5,"+ gather, ties, store",10.349,2.529,13.6
+4,50,6,+ merge sort,16.382,6.033,32.4
+4,50,7,"+ softmax, cut, draw",18.624,2.242,12.0
+4,100,1,high-byte histogram,4.143,1.603,6.5
+4,100,2,+ bucket search,4.244,0.101,0.4
+4,100,3,+ low-byte histogram,6.588,2.344,9.5
+4,100,4,+ exact threshold,7.698,1.11,4.5
+4,100,5,"+ gather, ties, store",12.269,4.571,18.6
+4,100,6,+ merge sort,20.484,8.215,33.4
+4,100,7,"+ softmax, cut, draw",24.576,4.092,16.7
+8,20,1,high-byte histogram,4.152,1.613,9.8
+8,20,2,+ bucket search,4.266,0.114,0.7
+8,20,3,+ low-byte histogram,6.593,2.327,14.2
+8,20,4,+ exact threshold,8.171,1.578,9.6
+8,20,5,"+ gather, ties, store",10.266,2.095,12.8
+8,20,6,+ merge sort,14.383,4.117,25.1
+8,20,7,"+ softmax, cut, draw",16.378,1.995,12.2
+8,50,1,high-byte histogram,4.145,1.61,7.9
+8,50,2,+ bucket search,4.264,0.119,0.6
+8,50,3,+ low-byte histogram,6.596,2.332,11.4
+8,50,4,+ exact threshold,8.171,1.575,7.7
+8,50,5,"+ gather, ties, store",10.262,2.091,10.2
+8,50,6,+ merge sort,16.386,6.124,29.9
+8,50,7,"+ softmax, cut, draw",20.476,4.09,20.0
+8,100,1,high-byte histogram,4.146,1.61,6.1
+8,100,2,+ bucket search,4.275,0.129,0.5
+8,100,3,+ low-byte histogram,6.598,2.323,8.7
+8,100,4,+ exact threshold,8.17,1.572,5.9
+8,100,5,"+ gather, ties, store",12.248,4.078,15.3
+8,100,6,+ merge sort,20.486,8.238,31.0
+8,100,7,"+ softmax, cut, draw",26.6,6.114,23.0
+16,20,1,high-byte histogram,6.168,3.633,18.6
+16,20,2,+ bucket search,6.175,0.007,0.0
+16,20,3,+ low-byte histogram,10.224,4.049,20.8
+16,20,4,+ exact threshold,10.228,0.004,0.0
+16,20,5,"+ gather, ties, store",14.339,4.111,21.1
+16,20,6,+ merge sort,18.144,3.805,19.5
+16,20,7,"+ softmax, cut, draw",19.497,1.353,6.9
+16,50,1,high-byte histogram,6.168,3.626,14.8
+16,50,2,+ bucket search,6.175,0.007,0.0
+16,50,3,+ low-byte histogram,10.225,4.05,16.5
+16,50,4,+ exact threshold,10.228,0.003,0.0
+16,50,5,"+ gather, ties, store",14.364,4.136,16.8
+16,50,6,+ merge sort,20.463,6.099,24.8
+16,50,7,"+ softmax, cut, draw",24.562,4.099,16.7
+16,100,1,high-byte histogram,6.17,3.634,12.7
+16,100,2,+ bucket search,6.176,0.006,0.0
+16,100,3,+ low-byte histogram,10.226,4.05,14.1
+16,100,4,+ exact threshold,10.229,0.003,0.0
+16,100,5,"+ gather, ties, store",15.121,4.892,17.1
+16,100,6,+ merge sort,22.544,7.423,25.9
+16,100,7,"+ softmax, cut, draw",28.665,6.121,21.4
+32,20,1,high-byte histogram,8.198,5.66,21.2
+32,20,2,+ bucket search,8.215,0.017,0.1
+32,20,3,+ low-byte histogram,16.387,8.172,30.6
+32,20,4,+ exact threshold,16.389,0.002,0.0
+32,20,5,"+ gather, ties, store",24.42,8.031,30.0
+32,20,6,+ merge sort,25.49,1.07,4.0
+32,20,7,"+ softmax, cut, draw",26.732,1.242,4.6
+32,50,1,high-byte histogram,8.202,5.669,18.5
+32,50,2,+ bucket search,8.215,0.013,0.0
+32,50,3,+ low-byte histogram,16.388,8.173,26.6
+32,50,4,+ exact threshold,16.389,0.001,0.0
+32,50,5,"+ gather, ties, store",24.58,8.191,26.7
+32,50,6,+ merge sort,27.504,2.924,9.5
+32,50,7,"+ softmax, cut, draw",30.726,3.222,10.5
+32,100,1,high-byte histogram,8.212,5.679,16.3
+32,100,2,+ bucket search,8.216,0.004,0.0
+32,100,3,+ low-byte histogram,16.388,8.172,23.4
+32,100,4,+ exact threshold,16.39,0.002,0.0
+32,100,5,"+ gather, ties, store",24.913,8.523,24.4
+32,100,6,+ merge sort,30.532,5.619,16.1
+32,100,7,"+ softmax, cut, draw",34.859,4.327,12.4

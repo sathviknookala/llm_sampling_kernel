@@ -1,0 +1,14 @@
+kernel,P,block,regs_per_thread,local_bytes,static_smem_bytes,max_blocks_per_sm,active_warps_per_sm,max_warps_per_sm,theoretical_occupancy_pct,limiter,shipped_at,gpu,git_commit
+topk_partial_kernel,,512,38,0,18468,3,48,48,100.0,threads+registers,all,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<bf16>,32,128,30,0,1284,12,48,48,100.0,threads,none,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<fp16>,32,128,34,0,1284,12,48,48,100.0,threads+registers,none,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<bf16>,64,128,33,0,1540,12,48,48,100.0,threads+registers,none,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<fp16>,64,128,33,0,1540,12,48,48,100.0,threads+registers,none,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<bf16>,128,128,48,0,2052,10,40,48,83.3,registers,B32k20,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<fp16>,128,128,48,0,2052,10,40,48,83.3,registers,B32k20,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<bf16>,256,128,88,0,3076,5,20,48,41.7,registers,B1k20 B4k20 B8k20 B16k20 B32k50,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<fp16>,256,128,88,0,3076,5,20,48,41.7,registers,B1k20 B4k20 B8k20 B16k20 B32k50,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<bf16>,512,128,130,0,5124,3,12,48,25.0,registers,B1k50 B4k50 B8k50 B16k50 B32k100,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<fp16>,512,128,130,0,5124,3,12,48,25.0,registers,B1k50 B4k50 B8k50 B16k50 B32k100,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<bf16>,1024,128,142,0,9220,3,12,48,25.0,registers,B1k100 B4k100 B8k100 B16k100,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty
+merge_sample_kernel<fp16>,1024,128,142,0,9220,3,12,48,25.0,registers,B1k100 B4k100 B8k100 B16k100,NVIDIA RTX PRO 4000 Blackwell,6ddf1e0-dirty

@@ -5,9 +5,10 @@ what this prototype delivers, and the gap is now measured rather than guessed.**
 
 `results/DECISION.md` ended with one instruction: before building the full kernel, find out whether
 a hand-written kernel can beat `flashinfer_from_probs` at 72.6 µs (B=1). It can. A first-pass fused
-kernel runs the whole operation — `[B, V]` logits to one token id per sequence — in **22.5 µs at
-B=1**, against **75.4 µs** for the best production sampler measured in the same process on the same
-instrument.
+kernel runs the whole operation — `[B, V]` logits to one token id per sequence — in **19.1 µs at
+B=1**, against **72.8 µs** for the best production sampler measured in the same process on the same
+instrument: **3.81×**. That is the register-resident merge (§8.2); the shared-memory bitonic it
+replaced ran 22.5 µs against 75.4 µs (3.35×), and both sweeps are committed.
 
 All numbers below come from committed artifacts under `results/raw/`, on an idle GPU with
 `clocks_locked=false`. Methodology: `docs/benchmark_methodology.md`.
@@ -16,43 +17,54 @@ All numbers below come from committed artifacts under `results/raw/`, on an idle
 
 ## 1. The result
 
-`results/raw/spike_ladder.csv` (1134 rows), `V=151936, k=50, p=0.90, bfloat16, hot`:
+`results/raw/spike_ladder_regmerge.csv` (1134 rows, register merge), `V=151936, k=50, p=0.90,
+bfloat16, hot`. The last column is the same cell in `results/raw/spike_ladder.csv` (shared bitonic,
+`df3e3c0`):
 
-| B | `hf_eager` | `graph_compile` | `flashinfer_from_probs` | **`fused_kernel`** | vs the bar |
-|---|---|---|---|---|---|
-| 1 | 325.2 | 72.4 | 75.4 | **22.5** | **3.35×** |
-| 4 | 598.7 | 95.2 | 75.4 | **22.5** | **3.35×** |
-| 8 | 707.0 | 98.3 | 75.5 | **22.6** | **3.35×** |
-| 16 | 1191.1 | 123.1 | 75.4 | **26.6** | **2.83×** |
-| 32 | 2195.0 | 168.8 | 101.2 | **34.8** | **2.91×** |
+| B | `hf_eager` | `graph_compile` | `flashinfer_from_probs` | **`fused_kernel`** | vs the bar | bitonic |
+|---|---|---|---|---|---|---|
+| 1 | 325.1 | 71.8 | 72.8 | **19.1** | **3.81×** | 22.5 (3.35×) |
+| 4 | 598.5 | 95.1 | 73.8 | **19.7** | **3.74×** | 22.5 (3.35×) |
+| 8 | 706.7 | 98.2 | 74.3 | **20.3** | **3.66×** | 22.6 (3.35×) |
+| 16 | 1181.5 | 122.2 | 74.3 | **24.6** | **3.02×** | 26.6 (2.83×) |
+| 32 | 2200.5 | 168.1 | 101.2 | **30.7** | **3.29×** | 34.8 (2.91×) |
 
-Across the full parameter grid the win is **2.28×–4.09×**, widest at small `k` and low batch:
+Across the full parameter grid the win is **2.50×–5.12×** (was 2.28×–4.09×), widest at small `k`
+and low batch, and the kernel is faster at every one of the 32 hot cells — 7.5–22.2%:
 
 | | k=20 | k=50 | k=100 |
 |---|---|---|---|
-| B=1, V=151936 | 20.3 µs (**3.69×**) | 22.5 µs (3.35×) | 30.3 µs (2.48×) |
-| B=32, V=151936 | 30.7 µs (3.35×) | 34.8 µs (2.91×) | 38.3 µs (2.69×) |
+| B=1, V=151936 | 16.3 µs (**4.49×**) | 19.1 µs (3.81×) | 24.1 µs (3.04×) |
+| B=32, V=151936 | 27.0 µs (3.81×) | 30.7 µs (3.29×) | 34.9 µs (2.95×) |
 
-fp16 matches bf16 within noise. Cold L2 narrows the win to 2.53×–3.37×.
+**Quote 3.81×, not the 5.12× top of the range.** The maximum is B=1, V=128256, k=20, where the
+fused rung's three rounds read 16.05 / 12.36 / 14.34 µs — about one ~2 µs quantum apart (§2.1) —
+while FlashInfer holds to 0.5%. Taking each cell's worst round instead of its median gives
+2.48×–4.64×. The anchor's rounds are 19.16 / 18.42 / 19.11 µs.
 
-**These numbers are slower than the first spike measured, deliberately.** At commit `33802d7` the
-kernel was 20.6 µs at B=1 / k=50 (3.59×) and 25.5 µs at k=100. Closing Gate A cost that: the cut
-now normalizes before taking the prefix, exactly as `reference.py` does, which is K per-element
-divisions the old `cum[i-1] >= top_p * z` form did not pay. The trade is **~9% at k=50 and ~19% at
-k=100 in exchange for an exact `keep` mask and a tie path with no capacity clamp**. It is recorded
-here rather than quietly absorbed, because the earlier 3.59× is in git history and will not
-reproduce.
+FlashInfer read 3.5% faster at the B=1 anchor in this sweep than in the previous one (1.5% median
+across the grid), so every ratio divides by FlashInfer from the *same* sweep. fp16 matches bf16 to
+0.7–1.2% at hot B ∈ {1, 4, 8, 32}; B=16 hot and B=1 cold diverge 8.3% and 9.8%, inside this rung's
+round-to-round spread. Cold L2 narrows the win to 2.70×–3.95× (was 2.53×–3.37×).
+
+**Gate A cost time, and the register merge more than won it back.** At commit `33802d7` the kernel
+was 20.6 µs at B=1 / k=50 (3.59×) and 25.5 µs at k=100. Closing Gate A took the bitonic kernel to
+22.5 / 30.3 µs: the cut now normalizes before taking the prefix, exactly as `reference.py` does,
+which is K per-element divisions the old `cum[i-1] >= top_p * z` form did not pay — **~9% at k=50
+and ~19% at k=100 in exchange for an exact `keep` mask and a tie path with no capacity clamp**. The
+register merge then brought it to 19.1 / 24.1 µs, below the pre-Gate-A kernel, with Gate A intact.
+The 3.59× is in git history and is recorded here because it will not reproduce as such.
 
 **The comparison is deliberately unfavourable to this kernel.** `flashinfer_from_probs` is handed a
 `[B, V]` probability tensor that someone else already softmaxed; the fused kernel consumes raw
-logits and does the softmax itself. It still wins by 3.6×.
+logits and does the softmax itself. It still wins by 3.8×.
 
 ## 2. What it is not: the 5–20× in `DECISION.md` §6
 
 §6 projected "single-digit to low tens of microseconds, i.e. a 5–20× operator win at low batch."
 The prototype lands at the top of that latency range and the bottom of that ratio range. **The
 claim should be restated as ~3–4× until a second kernel iteration says otherwise**, and the
-headline should be the measured 3.35×, not the projection.
+headline should be the measured 3.81×, not the projection.
 
 The reason is measured, not inferred. `results/raw/kernel_floor.csv` (135 rows) brackets what any
 kernel can reach in this rig at `V=151936, bf16, hot`:
@@ -64,13 +76,17 @@ kernel can reach in this rig at `V=151936, bf16, hot`:
 | `scan_split` — one full pass, best split | **4.49** | 6.18 | 10.38 | the split grid shape |
 | `torch_argmax` — for calibration | 8.41 | 10.30 | 15.69 | |
 
-So one full pass over the vocabulary costs **4.49 µs** at B=1 and the kernel costs 22.5 µs — it is
-**5.0× above its own floor**, and that is where the missing speedup is.
+So one full pass over the vocabulary costs **4.49 µs** at B=1 and the kernel costs 19.1 µs — it is
+**4.3× above its own floor** (5.0× before the register merge), and that is where the missing
+speedup is. The floor probes do not touch the merge, so the `df3e3c0` measurement still applies.
 
 The floor probe also settled a question that mattered more than expected: at B=1 the rig's dispatch
 floor is 2.50 µs, not tens of microseconds. **The 74 µs bar is real device work, not instrument.**
 
-### 2.1 Where the 22.5 µs actually goes — measured, superseding an earlier guess
+### 2.1 Where the time actually goes — measured, superseding an earlier guess
+
+> **This subsection is the bitonic baseline** (`kernel_phases.csv`, `df3e3c0`), kept because §8.2's
+> comparison is against it. The register merge's breakdown is §8.2.
 
 An earlier revision of this section attributed the gap to three row passes, ~50 block syncs and the
 bitonic merge, in roughly equal parts. **That was inference and it was wrong about the balance.**
@@ -94,7 +110,7 @@ derived table. At `V=151936, k=50, bf16, hot`:
 Three things this changes:
 
 - **At low batch the merge kernel is the largest single cost** — 12.2 µs of 22.5 at B=1, of which
-  the bitonic sort is 36%. It launches `<<<B, 512>>>`, so at B=1 it is one block on a 70-SM GPU.
+  the bitonic sort is 36%. It launched `<<<B, 1024>>>`, so at B=1 it is one block on a 70-SM GPU.
   The three row passes together are 34%.
 - **The mechanism is confirmed, not assumed.** Merge cost tracks the bitonic *stage count* across
   `k`: 6.13 / 8.12 / 11.92 µs for 36 / 45 / 55 stages at `k=20/50/100`, i.e. 0.170 / 0.180 / 0.217
@@ -124,7 +140,8 @@ same ~19K elements either way, and adding rows costs almost nothing until B=16. 
 bound by its phase chain, not by throughput.
 
 **The auto split rule is now leaving 18% on the table at small `k`.** `make_plan` uses
-`clamp(128/B, 4, 8)`, which was right when it was fitted. Re-measured on the current kernel:
+`clamp(128/B, 4, 8)`, which was right when it was fitted. Re-measured on the bitonic kernel
+(`df3e3c0`):
 
 | | best splits | at best | auto | auto cost |
 |---|---|---|---|---|
@@ -138,7 +155,9 @@ The rule is still right at `k=50` and `k=100` and at B=32; it is only wrong at `
 merge is small enough that more splits keep paying. A rule that depends on `k` as well as `B` is
 the cheapest win currently on the table, and it is measurement, not redesign. It is deliberately
 **not** applied in this revision: it would invalidate the ladder measured above, and the ladder
-and the split sweep have to come from the same binary.
+and the split sweep have to come from the same binary. **This table is the bitonic binary**
+(`df3e3c0`): more splits trade traversal time against a larger merge, and the register merge
+changed the price of the merge, so the refit has to start by re-running `kernel_floor`.
 
 ## 4. Correctness
 
@@ -163,9 +182,18 @@ and the split sweep have to come from the same binary.
   draws; equal logits sample uniformly.
 - **Graph replay advances the RNG.** The offset comes from torch's generator via `PhiloxCudaState`,
   not a host counter that capture would freeze.
-- **319 passed, 2 skipped.** Every claim above is falsified, not just asserted: inverting the index
-  half of the packed key fails 32 tests; forcing the old clamped tie path fails 4; relaxing the
-  strict `<` at the cut fails 8; restoring the host RNG counter fails the replay test.
+- **319 passed, 2 skipped** — on the bitonic merge and again, unchanged, on the register merge
+  (`results/raw/pytest_regmerge.txt`).
+  Every claim above is falsified, not just asserted: inverting the index half of the packed key
+  fails 32 tests; forcing the old clamped tie path fails 4; relaxing the strict `<` at the cut
+  fails 8; restoring the host RNG counter fails the replay test.
+- **Sanitizer-clean.** `compute-sanitizer` memcheck, racecheck and initcheck over the 104 kernel
+  tests: 0 errors, 0 hazards (`results/raw/sanitizer.csv`, logs under `results/raw/sanitizer/`).
+  initcheck runs *unfiltered* — with `--kernel-name` it stops tracking writes by torch's kernels
+  and reports every torch-produced input as uninitialized. A positive control proves the clean run
+  discriminates: never-written `torch.empty` logits trip initcheck inside `topk_partial_kernel`
+  (the `initcheck_positive_control` row, log `sanitizer/initcheck_control.log`). The suite log is
+  `results/raw/pytest_regmerge.txt`.
 
 One test here was worth recording as a near-miss. The general `keep` comparison passed unchanged
 when the cut was perturbed by 1e-7 relative, because Gaussian logits never put the exclusive prefix
@@ -187,7 +215,8 @@ makes every packed value unique.
    exact top-K of its slice. Tie sets too large for the shared buffer fall back to a second index
    bucketing plus a bitmap over the boundary bucket, which cannot overflow because the bucket is
    `2^shift` wide — so there is no capacity clamp on the answer.
-2. `merge_sample_kernel`, grid `B` — bitonic-sorts the `splits × K` candidates, decodes values back
+2. `merge_sample_kernel`, grid `B`, 128 threads — warp 0 sorts the `splits × K` candidates in
+   registers (§8.2), then the block decodes values back
    out of the keys (no second read of the logits), fp32 softmax over the survivors, top-p cut on the
    exclusive prefix, and an inverse-CDF draw against `u · Z_p`.
 
@@ -198,9 +227,9 @@ passed in and no extra launch is paid.
 
 ## 6. What this does not claim
 
-- **Not an end-to-end decode win.** Sampling is 0.16–1.2% of a decode step
-  (`results/raw/amdahl_probe.csv`). At 3.6×, the end-to-end saving is 0.12–0.86% for Qwen2-0.5B and
-  ~0.1% for Mistral-7B. This remains an operator-specialization result, exactly as
+- **Not an end-to-end decode win.** Sampling is 0.16–1.2% of a decode step at B=1
+  (`results/raw/amdahl_probe.csv`, measured with the `flashinfer` rung), which is the ceiling on
+  any end-to-end gain from a faster sampler. This remains an operator-specialization result, exactly as
   `DECISION.md` §9 required.
 - **Gate A is closed; Gate B is not.** `topk_ids` and `keep` are exact against `reference.py` --
   `keep` at 0 mismatches over 195 840 elements across 54 configurations -- and ties are now
@@ -209,14 +238,21 @@ passed in and no extra launch is paid.
   gate (Gate B) still has not been run on the kernel.
 - **Not measured with hardware counters.** `ncu` is confirmed unavailable to this user:
   `/proc/driver/nvidia/params` reports `RmProfilingAdminOnly: 1`. Every attribution above is
-  wall-clock, from isolated timing and the floor probes.
+  wall-clock, from isolated timing and the floor probes. What *is* measured without counters:
+  per-kernel device time from a CUPTI activity trace (`results/raw/kernel_trace.csv`) and
+  theoretical occupancy from the CUDA occupancy API (`results/raw/kernel_attrs.csv`) — the same
+  figure Nsight reports under that name. Achieved occupancy and stall reasons are not.
 - **Amortized throughput timing.** Consecutive iterations overlap, so these numbers understate
-  per-call launch latency in a real dependent decode loop. Two launches per call means the kernel
-  benefits from that overlap somewhat more than a single-launch rung would.
+  per-call launch latency in a real dependent decode loop. Both rungs benefit: the fused kernel
+  issues 2 launches per call and `flashinfer_from_probs` 9 (`results/raw/kernel_trace.csv`), and
+  neither the size nor the direction of the net bias between them is measured.
 - **FlashInfer's semantics differ** — it applies top-k/top-p to the full-vocabulary distribution
   where this repo renormalizes within the top-k survivors first. It is a performance rung, never a
   correctness target.
-- **Clocks are not locked** (no permission). Round-to-round spread is 0.4% for this rung.
+- **Clocks are not locked** (no permission). In `spike_ladder_regmerge.csv` the fused rung's
+  round-to-round spread, (max − min) / median, is 1.3% median and **25.7% worst case** (the B=1,
+  k=20 cell in §1), against 0.3% / 1.0% for `flashinfer_from_probs`. On the same definition the
+  bitonic sweep was 0.5% / 18.0%.
 
 ## 7. Measured non-results
 
@@ -239,19 +275,83 @@ not spend the same time rediscovering them.
   branch. See the resolution caveat above — at B=1 the ~2.05 µs quantum is larger than most of what
   was being compared.
 
-`MERGE_BLOCK` is 512. It measured −7% at B=32 against the pre-Gate-A binary; re-measured after the
-Gate A work it is within noise of 1024 at every `k`. 128 and 256 are clearly worse at B=1.
+`MERGE_BLOCK` is **1024** in every bitonic-era artifact (`df3e3c0`) and **128** in every
+`*_regmerge` artifact. 512 measured −7% at B=32 against the pre-Gate-A binary (`643d369`);
+re-measured after the Gate A work it was within noise of 1024 at every `k`, so `df3e3c0` put it
+back. 128 and 256 were clearly worse at B=1 — but that was measured when the block itself ran the
+bitonic sort, which is no longer true (§8.2), so it did not transfer to the register merge.
 
 ## 8. Next
 
 1. **Refit the split rule on `k`, not just `B`.** Measured 21.7% at B=1/k=20 and 10.3% at
-   B=8/k=20 (§3). Cheapest item here by a wide margin.
-2. **A barrier-free merge.** The merge is the largest single cost at low batch and its price is
-   0.18 µs per bitonic stage — that is barrier and shared-memory round-trip, not arithmetic. Held
-   in registers across one warp with `__shfl_xor`, a cyclic layout makes every `j >= 32` stage
-   purely local and every `j < 32` stage a single shuffle, with no `__syncthreads` at all.
+   B=8/k=20 (§3) — on the bitonic binary; re-measure first.
+2. **A barrier-free merge — MEASURED: 7.5–22.2% faster at every hot cell, landed.** The bitonic
+   merge was the largest single cost at low batch at 0.18 µs per stage — barrier and shared-memory
+   round-trip, not arithmetic. `fs::warp_merge_sort` holds the candidates in one warp's registers
+   and does the whole sort with `__shfl_xor_sync` and zero `__syncthreads`. The layout is
+   **blocked, not cyclic** — bitonic's inner loop runs `j = k/2 … 1`, so small `j` is the common
+   case, and blocked makes exactly those stages register-local (15 shuffle stages at P=512 against
+   cyclic's 35) — and `MERGE_BLOCK` drops 1024 → 128, because a 1024-thread block caps ptxas at 64
+   registers per thread and the P=1024 candidate array alone wants 64. **The block-size change is
+   confounded with the merge change; everything below is one result, not two.**
+
+   **Build**, `ptxas -v` at `sm_120`, production merge (`STOP=2`, bf16), against the same flags on
+   the pre-change source; the runtime API (`results/raw/kernel_attrs.csv`) agrees on every register
+   and shared-memory figure:
+
+   | | baseline (shared bitonic) | P=128 | P=256 | P=512 (k=50) | P=1024 (k=100) |
+   |---|---|---|---|---|---|
+   | registers | 30 | 48 | 88 | 130 | 142 |
+   | spill stores / loads | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | **0 / 0** |
+   | shared bytes | 9220 | 2052 | 3076 | 5124 | 9220 |
+   | `__syncthreads` executed | 49 (P=512) | 4 | 4 | 4 | 4 |
+   | SASS | 27 KB | 73 KB | 123 KB | 236 KB | **451 KB** |
+   | theoretical occupancy | | 83.3% | 41.7% | 25.0% | 25.0% |
+
+   - **No spill at any width** — 0 local bytes in all 13 instantiations (the 9 the measured grid
+     dispatches, plus P=32/64), from
+     `cudaFuncGetAttributes`, not just ptxas. Every register index is a template parameter, so the
+     candidate array cannot lower to local memory.
+   - **Barriers collapse from 49 to 4, independent of `P`.** The only 4 left are the one that
+     publishes `buf` and the three in the softmax tail.
+   - **Occupancy is register-limited and does not matter here.** 130 registers hold P=512 to 3
+     blocks/SM (25%); at B ≤ 16 the merge grid is B blocks on 70 SMs, so no SM ever sees a second
+     block. The partial kernel is 100% (38 registers, 512 threads).
+
+   **Measured**, `results/raw/kernel_phase_breakdown_regmerge.csv` (9 rounds) against §2.1's
+   `kernel_phase_breakdown.csv`, `V=151936, bf16, hot`:
+
+   | | B=1 k=20 | B=1 k=50 | B=1 k=100 | B=32 k=20 | B=32 k=50 | B=32 k=100 |
+   |---|---|---|---|---|---|---|
+   | phase 6, sort | 6.13 → **4.10** | 8.12 → **6.10** | 11.92 → **8.12** | 4.14 → **1.07** | 5.21 → **2.92** | 7.46 → **5.62** |
+   | phases 1–5, partial kernel | 10.25 → 10.25 | 10.30 → 10.27 | 10.75 → 10.35 | 24.53 → 24.42 | 24.59 → 24.58 | 25.04 → 24.91 |
+   | whole kernel | 20.19 → **16.35** | 22.51 → **18.46** | 28.62 → **22.56** | 30.72 → **26.73** | 34.81 → **30.73** | 38.91 → **34.86** |
+
+   - **The sort got cheaper and nothing else moved.** Phases 1–5 run the same code and hold within
+     0–4%, which is the control: the change is in the merge kernel and nowhere else.
+   - **The merge kernel (phases 6+7) fell 12.21 → 8.19 µs at B=1, k=50 and 10.22 → 6.15 at
+     B=32.** At B=1 the sort and tail deltas individually land on multiples of the ~2.05 µs
+     quantum (the tail read 4.09 → 2.09, exactly one quantum), so only the group is resolvable
+     there. At B=32, which is off the quantum, the tail fell 5.01 → 3.22 alongside the sort — the
+     128-thread block, not the sort, is the only candidate for that.
+   - **The instruction-footprint risk did not materialize.** The 451 KB k=100 kernel gained as much
+     as the 236 KB k=50 one (32% vs 25% on the sort at B=1), so there is no sign the straight-line
+     SASS is paying for instruction fetch. Re-rolling the cross-lane stages is not needed. With
+     `ncu` blocked this is wall-clock evidence, not a stall-reason measurement.
+   - **The balance has moved toward the row passes, but not everywhere.** At B=32 the three
+     traversals (phases 1, 3, 5) are 22.03 µs (72%) against the merge kernel's 6.15 µs (20%), and
+     they also lead at B=16 for k ≤ 50. At B ≤ 8 with k ≥ 50 the merge kernel is still the larger
+     cost — 8.19 against 7.40 µs at B=1, k=50 (`kernel_phase_breakdown_regmerge.csv`).
+
+   **Launches**, `results/raw/kernel_trace.csv` (CUPTI activity trace, 50 steps, bf16 anchor):
+   the fused path is **2 kernels and 0 memcpy/memset per step** at B=1 and B=32 — partial 9.48 µs
+   + merge 8.36 µs of device time at B=1, 21.63 + 6.39 at B=32. `hf_eager` is 47 / 51 kernels plus
+   17 / 19 memcpy and memset, which reconciles exactly with `launch_counts.csv`'s 64 / 70 device
+   operations; `flashinfer_from_probs` is 9. Device time is kernel-busy time and excludes launch
+   gaps, so it sits below the ladder's latency.
 3. **Run Gate B** — the fp32 fidelity gate, the one gate still not run on the kernel.
-4. Collapse the three row passes into one register-resident warp select — 34% at B=1, 63% at B=32.
+4. **Collapse the three row passes into one register-resident warp select** — 40% of the kernel
+   at B=1 and 72% at B=32; the largest cost at B=32 and at B=16 for k ≤ 50.
 5. Re-measure and decide whether `DECISION.md` §6's 5–20× is reachable or should be retired.
 
 ## Reproduction
@@ -262,12 +362,27 @@ V=~/.venv_flashinfer/bin/python
 $V setup.py build_ext --inplace
 $V -m pytest tests/ -q
 $V -m benchmarks.kernel_floor                       # kernel_floor.csv + kernel_splits.csv
-$V -m benchmarks.kernel_phases --rounds 9           # kernel_phases.csv + kernel_phase_breakdown.csv
+$V -m benchmarks.kernel_phases --rounds 9 \
+    --out results/raw/kernel_phases_regmerge.csv \
+    --breakdown-out results/raw/kernel_phase_breakdown_regmerge.csv
 $V -m benchmarks.benchmark_sampling --rounds 3 --reps 5 \
-    --out results/raw/spike_ladder.csv --env-out results/raw/environment_spike.json
-$V -m benchmarks.summarize --raw results/raw/spike_ladder.csv --out results/summary_spike.md
+    --out results/raw/spike_ladder_regmerge.csv --env-out results/raw/environment_regmerge.json
+$V -m benchmarks.summarize --raw results/raw/spike_ladder_regmerge.csv --out results/summary_regmerge.md
+$V -m benchmarks.kernel_trace                       # kernel_trace.csv
+$V -m benchmarks.kernel_attrs                       # kernel_attrs.csv
+$V -m benchmarks.sanitize                           # sanitizer.csv + sanitizer/*.log
 ```
+
+The bitonic-era artifacts (`spike_ladder.csv`, `kernel_phases.csv`, `kernel_phase_breakdown.csv`,
+`environment_spike.json`, `summary_spike.md`) come from the same commands with their default or
+`_spike` output names at `df3e3c0`; they are kept as the baseline §8.2 compares against.
+
+**Provenance.** Every `*_regmerge` artifact, `kernel_trace.csv`, `kernel_attrs.csv`,
+`sanitizer.csv` and `pytest_regmerge.txt` records `6ddf1e0-dirty`: the register merge at `0c9de95`
+plus the additive `kernel_attrs()` debug binding and the new measurement scripts — no kernel source
+differs from `0c9de95`. The bitonic baseline is `df3e3c0` (`spike_ladder.csv` records
+`df3e3c0-dirty` for the same reason: uncommitted scripts, not kernel source).
 
 The extension is built and benchmarked in `~/.venv_flashinfer` (torch 2.9.1+cu128), the only
 environment where the kernel and FlashInfer can be timed in one process. `results/raw/environment_spike.json`
-records the `.so` path and mtime that produced these numbers.
+and `environment_regmerge.json` record the `.so` path and mtime that produced each sweep.

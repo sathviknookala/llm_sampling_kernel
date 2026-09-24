@@ -1,0 +1,125 @@
+/home/sathvik/cuda-12.9/bin/compute-sanitizer --tool initcheck --print-limit 5 /home/sathvik/.venv_flashinfer/bin/python -c import torch; import fused_sampling; x = torch.empty(4, 151936, device='cuda', dtype=torch.bfloat16); fused_sampling.sample_fused(x, 50, 0.9, 1, 0, 0); torch.cuda.synchronize()
+
+========= COMPUTE-SANITIZER
+========= Uninitialized __global__ memory read of size 16 bytes
+=========     at void <unnamed>::foreach_key<void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)::[lambda(int, unsigned int) (instance 1)]>(const unsigned short *, int, int, int, int, T1)+0xc90 in fused_sampling.cu:33
+=========     by thread (64,0,0) in block (0,0,0)
+=========     Address 0x77963e600400
+=========         Device Frame: void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)+0xb70 in fused_sampling.cu:169
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: sample_fused(at::Tensor, long, double, long, long, long) [0xa4adad] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor, at::Tensor, long, double, long, long, long, pybind11::name, pybind11::scope, pybind11::sibling, char [44]>(at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor (*)(at::Tensor, long, double, long, long, long), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, char const (&) [44])::{lambda(pybind11::detail::function_call&)#3}::_FUN(pybind11::detail::function_call&) [0xa47e2a] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object*, _object*) [0xa43e35] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: cfunction_call in methodobject.c:537 [0x21ea67] in python
+=========         Host Frame: _PyObject_MakeTpCall in call.c:240 [0x1f555b] in python
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2715 [0x1ff874] in python
+=========         Host Frame: PyEval_EvalCode in ceval.c:580 [0x2b83de] in python
+=========         Host Frame: run_eval_code_obj in pythonrun.c:1757 [0x2f4019] in python
+=========         Host Frame: run_mod in pythonrun.c:1778 [0x2eec84] in python
+=========         Host Frame: PyRun_StringFlags in pythonrun.c:1649 [0x2eaf01] in python
+=========         Host Frame: PyRun_SimpleStringFlags in pythonrun.c:506 [0x2eac7b] in python
+=========         Host Frame: Py_RunMain in main.c:714 [0x2e81a1] in python
+=========         Host Frame: Py_BytesMain in main.c:768 [0x2a00b6] in python
+=========         Host Frame: __libc_start_call_main in libc_start_call_main.h:58 [0x29d8f] in libc.so.6
+=========         Host Frame: __libc_start_main in libc-start.c:392 [0x29e3f] in libc.so.6
+=========         Host Frame: _start [0x29ff2d] in python
+=========         Host Frame: <module> in <string>:1
+========= 
+========= Uninitialized __global__ memory read of size 16 bytes
+=========     at void <unnamed>::foreach_key<void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)::[lambda(int, unsigned int) (instance 1)]>(const unsigned short *, int, int, int, int, T1)+0xc90 in fused_sampling.cu:33
+=========     by thread (65,0,0) in block (0,0,0)
+=========     Address 0x77963e600410
+=========         Device Frame: void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)+0xb70 in fused_sampling.cu:169
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: sample_fused(at::Tensor, long, double, long, long, long) [0xa4adad] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor, at::Tensor, long, double, long, long, long, pybind11::name, pybind11::scope, pybind11::sibling, char [44]>(at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor (*)(at::Tensor, long, double, long, long, long), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, char const (&) [44])::{lambda(pybind11::detail::function_call&)#3}::_FUN(pybind11::detail::function_call&) [0xa47e2a] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object*, _object*) [0xa43e35] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: cfunction_call in methodobject.c:537 [0x21ea67] in python
+=========         Host Frame: _PyObject_MakeTpCall in call.c:240 [0x1f555b] in python
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2715 [0x1ff874] in python
+=========         Host Frame: PyEval_EvalCode in ceval.c:580 [0x2b83de] in python
+=========         Host Frame: run_eval_code_obj in pythonrun.c:1757 [0x2f4019] in python
+=========         Host Frame: run_mod in pythonrun.c:1778 [0x2eec84] in python
+=========         Host Frame: PyRun_StringFlags in pythonrun.c:1649 [0x2eaf01] in python
+=========         Host Frame: PyRun_SimpleStringFlags in pythonrun.c:506 [0x2eac7b] in python
+=========         Host Frame: Py_RunMain in main.c:714 [0x2e81a1] in python
+=========         Host Frame: Py_BytesMain in main.c:768 [0x2a00b6] in python
+=========         Host Frame: __libc_start_call_main in libc_start_call_main.h:58 [0x29d8f] in libc.so.6
+=========         Host Frame: __libc_start_main in libc-start.c:392 [0x29e3f] in libc.so.6
+=========         Host Frame: _start [0x29ff2d] in python
+=========         Host Frame: <module> in <string>:1
+========= 
+========= Uninitialized __global__ memory read of size 16 bytes
+=========     at void <unnamed>::foreach_key<void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)::[lambda(int, unsigned int) (instance 1)]>(const unsigned short *, int, int, int, int, T1)+0xc90 in fused_sampling.cu:33
+=========     by thread (66,0,0) in block (0,0,0)
+=========     Address 0x77963e600420
+=========         Device Frame: void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)+0xb70 in fused_sampling.cu:169
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: sample_fused(at::Tensor, long, double, long, long, long) [0xa4adad] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor, at::Tensor, long, double, long, long, long, pybind11::name, pybind11::scope, pybind11::sibling, char [44]>(at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor (*)(at::Tensor, long, double, long, long, long), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, char const (&) [44])::{lambda(pybind11::detail::function_call&)#3}::_FUN(pybind11::detail::function_call&) [0xa47e2a] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object*, _object*) [0xa43e35] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: cfunction_call in methodobject.c:537 [0x21ea67] in python
+=========         Host Frame: _PyObject_MakeTpCall in call.c:240 [0x1f555b] in python
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2715 [0x1ff874] in python
+=========         Host Frame: PyEval_EvalCode in ceval.c:580 [0x2b83de] in python
+=========         Host Frame: run_eval_code_obj in pythonrun.c:1757 [0x2f4019] in python
+=========         Host Frame: run_mod in pythonrun.c:1778 [0x2eec84] in python
+=========         Host Frame: PyRun_StringFlags in pythonrun.c:1649 [0x2eaf01] in python
+=========         Host Frame: PyRun_SimpleStringFlags in pythonrun.c:506 [0x2eac7b] in python
+=========         Host Frame: Py_RunMain in main.c:714 [0x2e81a1] in python
+=========         Host Frame: Py_BytesMain in main.c:768 [0x2a00b6] in python
+=========         Host Frame: __libc_start_call_main in libc_start_call_main.h:58 [0x29d8f] in libc.so.6
+=========         Host Frame: __libc_start_main in libc-start.c:392 [0x29e3f] in libc.so.6
+=========         Host Frame: _start [0x29ff2d] in python
+=========         Host Frame: <module> in <string>:1
+========= 
+========= Uninitialized __global__ memory read of size 16 bytes
+=========     at void <unnamed>::foreach_key<void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)::[lambda(int, unsigned int) (instance 1)]>(const unsigned short *, int, int, int, int, T1)+0xc90 in fused_sampling.cu:33
+=========     by thread (67,0,0) in block (0,0,0)
+=========     Address 0x77963e600430
+=========         Device Frame: void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)+0xb70 in fused_sampling.cu:169
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: sample_fused(at::Tensor, long, double, long, long, long) [0xa4adad] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor, at::Tensor, long, double, long, long, long, pybind11::name, pybind11::scope, pybind11::sibling, char [44]>(at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor (*)(at::Tensor, long, double, long, long, long), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, char const (&) [44])::{lambda(pybind11::detail::function_call&)#3}::_FUN(pybind11::detail::function_call&) [0xa47e2a] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object*, _object*) [0xa43e35] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: cfunction_call in methodobject.c:537 [0x21ea67] in python
+=========         Host Frame: _PyObject_MakeTpCall in call.c:240 [0x1f555b] in python
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2715 [0x1ff874] in python
+=========         Host Frame: PyEval_EvalCode in ceval.c:580 [0x2b83de] in python
+=========         Host Frame: run_eval_code_obj in pythonrun.c:1757 [0x2f4019] in python
+=========         Host Frame: run_mod in pythonrun.c:1778 [0x2eec84] in python
+=========         Host Frame: PyRun_StringFlags in pythonrun.c:1649 [0x2eaf01] in python
+=========         Host Frame: PyRun_SimpleStringFlags in pythonrun.c:506 [0x2eac7b] in python
+=========         Host Frame: Py_RunMain in main.c:714 [0x2e81a1] in python
+=========         Host Frame: Py_BytesMain in main.c:768 [0x2a00b6] in python
+=========         Host Frame: __libc_start_call_main in libc_start_call_main.h:58 [0x29d8f] in libc.so.6
+=========         Host Frame: __libc_start_main in libc-start.c:392 [0x29e3f] in libc.so.6
+=========         Host Frame: _start [0x29ff2d] in python
+=========         Host Frame: <module> in <string>:1
+========= 
+========= Uninitialized __global__ memory read of size 16 bytes
+=========     at void <unnamed>::foreach_key<void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)::[lambda(int, unsigned int) (instance 1)]>(const unsigned short *, int, int, int, int, T1)+0xc90 in fused_sampling.cu:33
+=========     by thread (68,0,0) in block (0,0,0)
+=========     Address 0x77963e600440
+=========         Device Frame: void <unnamed>::topk_partial_kernel<(int)5>(const unsigned short *, unsigned long *, int, int, int, int, int)+0xb70 in fused_sampling.cu:169
+=========     Saved host backtrace up to driver entry point at kernel launch time
+=========         Host Frame: sample_fused(at::Tensor, long, double, long, long, long) [0xa4adad] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::initialize<at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor, at::Tensor, long, double, long, long, long, pybind11::name, pybind11::scope, pybind11::sibling, char [44]>(at::Tensor (*&)(at::Tensor, long, double, long, long, long), at::Tensor (*)(at::Tensor, long, double, long, long, long), pybind11::name const&, pybind11::scope const&, pybind11::sibling const&, char const (&) [44])::{lambda(pybind11::detail::function_call&)#3}::_FUN(pybind11::detail::function_call&) [0xa47e2a] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: pybind11::cpp_function::dispatcher(_object*, _object*, _object*) [0xa43e35] in fused_sampling.cpython-312-x86_64-linux-gnu.so
+=========         Host Frame: cfunction_call in methodobject.c:537 [0x21ea67] in python
+=========         Host Frame: _PyObject_MakeTpCall in call.c:240 [0x1f555b] in python
+=========         Host Frame: _PyEval_EvalFrameDefault in bytecodes.c:2715 [0x1ff874] in python
+=========         Host Frame: PyEval_EvalCode in ceval.c:580 [0x2b83de] in python
+=========         Host Frame: run_eval_code_obj in pythonrun.c:1757 [0x2f4019] in python
+=========         Host Frame: run_mod in pythonrun.c:1778 [0x2eec84] in python
+=========         Host Frame: PyRun_StringFlags in pythonrun.c:1649 [0x2eaf01] in python
+=========         Host Frame: PyRun_SimpleStringFlags in pythonrun.c:506 [0x2eac7b] in python
+=========         Host Frame: Py_RunMain in main.c:714 [0x2e81a1] in python
+=========         Host Frame: Py_BytesMain in main.c:768 [0x2a00b6] in python
+=========         Host Frame: __libc_start_call_main in libc_start_call_main.h:58 [0x29d8f] in libc.so.6
+=========         Host Frame: __libc_start_main in libc-start.c:392 [0x29e3f] in libc.so.6
+=========         Host Frame: _start [0x29ff2d] in python
+=========         Host Frame: <module> in <string>:1
+========= 
+========= ERROR SUMMARY: 379840 errors
+========= ERROR SUMMARY: 379835 errors were not printed. Use --print-limit option to adjust the number of printed errors

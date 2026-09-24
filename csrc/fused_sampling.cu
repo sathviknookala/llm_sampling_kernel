@@ -11,7 +11,9 @@
 namespace {
 
 constexpr int BLOCK = 512;
-constexpr int MERGE_BLOCK = 1024;
+// the merge sorts in registers on warp 0: a 1024-thread block caps ptxas at 64 regs/thread,
+// which the P=1024 candidate array alone would consume. the remaining warps serve the K-wide tail.
+constexpr int MERGE_BLOCK = 128;
 constexpr int NSUB = 8;
 constexpr int TIE_CAP = 2048;
 constexpr int MERGE_CAP = 1024;
@@ -275,29 +277,22 @@ __global__ void topk_partial_kernel(const uint16_t* __restrict__ x, uint64_t* __
   for (int i = t; i < K; i += BLOCK) out[i] = (i < keff) ? cand[i] : 0ull;
 }
 
-__device__ __forceinline__ void merge_sort_shared(const uint64_t* __restrict__ src, uint64_t* buf,
-                                                  int n, int P) {
-  for (int i = threadIdx.x; i < P; i += blockDim.x) buf[i] = (i < n) ? src[i] : 0ull;
-  __syncthreads();
-  if (P > 1) fs::bitonic_ascending<uint64_t>(buf, P);
-}
-
-template <bool IS_BF16, int STOP>
+template <bool IS_BF16, int STOP, int P>
 // keep_out / renormed_out are the Gate A stage tensors; nullptr on the production path, so the
 // gate measures the kernel's own arithmetic rather than a parallel copy of it
 __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
-                                    int64_t* __restrict__ out, int splits, int K, int P,
+                                    int64_t* __restrict__ out, int splits, int K,
                                     float top_p, uint64_t seed, uint64_t offset,
                                     at::PhiloxCudaState philox, bool from_gen,
                                     bool* __restrict__ keep_out, float* __restrict__ renormed_out) {
-  __shared__ uint64_t buf[MERGE_CAP];
+  __shared__ uint64_t buf[P];
   __shared__ float w[K_CAP];
   __shared__ float cum[K_CAP];
   __shared__ float s_z;
 
   const int t = threadIdx.x;
   const int b = blockIdx.x;
-  merge_sort_shared(partial + static_cast<size_t>(b) * splits * K, buf, splits * K, P);
+  fs::warp_merge_sort<P>(partial + static_cast<size_t>(b) * splits * K, buf, splits * K, K);
   if constexpr (STOP == 1) {
     if (t == 0) out[b] = static_cast<int64_t>(fs::unpack_idx(buf[P - 1]));
     return;
@@ -366,13 +361,48 @@ __global__ void merge_sample_kernel(const uint64_t* __restrict__ partial,
   }
 }
 
+template <int P>
 __global__ void merge_ids_kernel(const uint64_t* __restrict__ partial, int64_t* __restrict__ ids,
-                                 int splits, int K, int P) {
-  __shared__ uint64_t buf[MERGE_CAP];
-  merge_sort_shared(partial + static_cast<size_t>(blockIdx.x) * splits * K, buf, splits * K, P);
+                                 int splits, int K) {
+  __shared__ uint64_t buf[P];
+  fs::warp_merge_sort<P>(partial + static_cast<size_t>(blockIdx.x) * splits * K, buf, splits * K, K);
   int64_t* out = ids + static_cast<size_t>(blockIdx.x) * K;
   for (int i = threadIdx.x; i < K; i += blockDim.x)
     out[i] = static_cast<int64_t>(fs::unpack_idx(buf[P - 1 - i]));
+}
+
+// P is a template parameter of the merge, so the width is resolved here once per launch
+#define FS_MERGE_P_CASES(BODY)                                                                  \
+  switch (P) {                                                                                  \
+    case 32: BODY(32) break;                                                                    \
+    case 64: BODY(64) break;                                                                    \
+    case 128: BODY(128) break;                                                                  \
+    case 256: BODY(256) break;                                                                  \
+    case 512: BODY(512) break;                                                                  \
+    case 1024: BODY(1024) break;                                                                \
+    default: TORCH_CHECK(false, "unsupported merge width ", P);                                 \
+  }
+
+template <bool IS_BF16, int STOP>
+void launch_merge_sample(int P, int batch, cudaStream_t stream, const uint64_t* partial,
+                         int64_t* out, int splits, int K, float top_p, uint64_t seed,
+                         uint64_t offset, at::PhiloxCudaState philox, bool from_gen, bool* keep_out,
+                         float* renormed_out) {
+#define FS_BODY(PV)                                                                             \
+  merge_sample_kernel<IS_BF16, STOP, PV><<<batch, MERGE_BLOCK, 0, stream>>>(                    \
+      partial, out, splits, K, top_p, seed, offset, philox, from_gen, keep_out, renormed_out);
+  FS_MERGE_P_CASES(FS_BODY)
+#undef FS_BODY
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_merge_ids(int P, int batch, cudaStream_t stream, const uint64_t* partial, int64_t* ids,
+                      int splits, int K) {
+#define FS_BODY(PV)                                                                             \
+  merge_ids_kernel<PV><<<batch, MERGE_BLOCK, 0, stream>>>(partial, ids, splits, K);
+  FS_MERGE_P_CASES(FS_BODY)
+#undef FS_BODY
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 int next_pow2(int n) {
@@ -411,13 +441,14 @@ Plan make_plan(const torch::Tensor& logits, int64_t top_k, int64_t splits_overri
   const int autos = std::min(8, std::max(4, 128 / p.batch));
   p.splits = splits_override > 0 ? static_cast<int>(splits_override) : autos;
   p.splits = std::max(1, std::min({p.splits, MERGE_CAP / p.K, units}));
-  p.P = next_pow2(p.splits * p.K);
+  p.P = std::max(32, next_pow2(p.splits * p.K));
   return p;
 }
 
 }  // namespace
 
 #undef SUF
+#undef FS_MERGE_P_CASES
 
 // offset < 0 means "draw from torch's default CUDA generator", which is the only form that
 // survives cuda-graph capture -- a host-side counter is baked into the graph at capture time
@@ -447,18 +478,18 @@ torch::Tensor sample_fused(torch::Tensor logits, int64_t top_k, double top_p, in
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   const auto* pp = reinterpret_cast<const uint64_t*>(partial.data_ptr());
+  const uint64_t off = static_cast<uint64_t>(offset < 0 ? 0 : offset);
   if (is_bf16) {
-    merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
-        pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset < 0 ? 0 : offset), philox,
-        from_gen, nullptr, nullptr);
+    launch_merge_sample<true, MERGE_ALL>(p.P, p.batch, stream, pp, out.data_ptr<int64_t>(),
+                                         p.splits, p.K, static_cast<float>(top_p),
+                                         static_cast<uint64_t>(seed), off, philox, from_gen,
+                                         nullptr, nullptr);
   } else {
-    merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
-        pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset < 0 ? 0 : offset), philox,
-        from_gen, nullptr, nullptr);
+    launch_merge_sample<false, MERGE_ALL>(p.P, p.batch, stream, pp, out.data_ptr<int64_t>(),
+                                          p.splits, p.K, static_cast<float>(top_p),
+                                          static_cast<uint64_t>(seed), off, philox, from_gen,
+                                          nullptr, nullptr);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
@@ -473,10 +504,8 @@ torch::Tensor topk_fused(torch::Tensor logits, int64_t top_k, int64_t splits_ove
       reinterpret_cast<const uint16_t*>(logits.data_ptr()),
       reinterpret_cast<uint64_t*>(partial.data_ptr()), p.vocab, p.n_vec, p.splits, p.K, p.shift);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  merge_ids_kernel<<<p.batch, MERGE_BLOCK, 0, stream>>>(
-      reinterpret_cast<const uint64_t*>(partial.data_ptr()), ids.data_ptr<int64_t>(), p.splits,
-      p.K, p.P);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  launch_merge_ids(p.P, p.batch, stream, reinterpret_cast<const uint64_t*>(partial.data_ptr()),
+                   ids.data_ptr<int64_t>(), p.splits, p.K);
   return ids;
 }
 
@@ -511,14 +540,14 @@ torch::Tensor probe_phase(torch::Tensor logits, int64_t top_k, double top_p, int
   const auto* pr = reinterpret_cast<const uint64_t*>(partial.data_ptr());
   auto* o = out.data_ptr<int64_t>();
   const float tp = static_cast<float>(top_p);
+  const at::PhiloxCudaState none(0, 0);
   if (is_bf16) {
-    if (ms == 1) merge_sample_kernel<true, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, at::PhiloxCudaState(0, 0), false, nullptr, nullptr);
-    else merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, at::PhiloxCudaState(0, 0), false, nullptr, nullptr);
+    if (ms == 1) launch_merge_sample<true, 1>(p.P, p.batch, stream, pr, o, p.splits, p.K, tp, 0ull, 0ull, none, false, nullptr, nullptr);
+    else launch_merge_sample<true, MERGE_ALL>(p.P, p.batch, stream, pr, o, p.splits, p.K, tp, 0ull, 0ull, none, false, nullptr, nullptr);
   } else {
-    if (ms == 1) merge_sample_kernel<false, 1><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, at::PhiloxCudaState(0, 0), false, nullptr, nullptr);
-    else merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(pr, o, p.splits, p.K, p.P, tp, 0ull, 0ull, at::PhiloxCudaState(0, 0), false, nullptr, nullptr);
+    if (ms == 1) launch_merge_sample<false, 1>(p.P, p.batch, stream, pr, o, p.splits, p.K, tp, 0ull, 0ull, none, false, nullptr, nullptr);
+    else launch_merge_sample<false, MERGE_ALL>(p.P, p.batch, stream, pr, o, p.splits, p.K, tp, 0ull, 0ull, none, false, nullptr, nullptr);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
 
@@ -542,17 +571,48 @@ std::vector<torch::Tensor> stages_fused(torch::Tensor logits, int64_t top_k, dou
   const auto* pp = reinterpret_cast<const uint64_t*>(partial.data_ptr());
   auto* kp = keep.data_ptr<bool>();
   auto* rp = renormed.data_ptr<float>();
+  const at::PhiloxCudaState none(0, 0);
   if (is_bf16) {
-    merge_sample_kernel<true, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
-        pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), at::PhiloxCudaState(0, 0),
-        false, kp, rp);
+    launch_merge_sample<true, MERGE_ALL>(p.P, p.batch, stream, pp, out.data_ptr<int64_t>(),
+                                         p.splits, p.K, static_cast<float>(top_p),
+                                         static_cast<uint64_t>(seed),
+                                         static_cast<uint64_t>(offset), none, false, kp, rp);
   } else {
-    merge_sample_kernel<false, MERGE_ALL><<<p.batch, MERGE_BLOCK, 0, stream>>>(
-        pp, out.data_ptr<int64_t>(), p.splits, p.K, p.P, static_cast<float>(top_p),
-        static_cast<uint64_t>(seed), static_cast<uint64_t>(offset), at::PhiloxCudaState(0, 0),
-        false, kp, rp);
+    launch_merge_sample<false, MERGE_ALL>(p.P, p.batch, stream, pp, out.data_ptr<int64_t>(),
+                                          p.splits, p.K, static_cast<float>(top_p),
+                                          static_cast<uint64_t>(seed),
+                                          static_cast<uint64_t>(offset), none, false, kp, rp);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {out, keep, renormed};
+}
+
+using AttrRow = std::tuple<std::string, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
+
+template <typename F>
+static void attr_row(std::vector<AttrRow>& rows, const char* name, int P, int block, F* fn) {
+  cudaFuncAttributes a;
+  C10_CUDA_CHECK(cudaFuncGetAttributes(&a, fn));
+  int blocks = 0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fn, block, 0));
+  rows.emplace_back(name, P, block, a.numRegs, static_cast<int64_t>(a.localSizeBytes),
+                    static_cast<int64_t>(a.sharedSizeBytes), blocks);
+}
+
+template <int P>
+static void merge_attr_rows(std::vector<AttrRow>& rows) {
+  attr_row(rows, "merge_sample_kernel<bf16>", P, MERGE_BLOCK, merge_sample_kernel<true, MERGE_ALL, P>);
+  attr_row(rows, "merge_sample_kernel<fp16>", P, MERGE_BLOCK, merge_sample_kernel<false, MERGE_ALL, P>);
+}
+
+// debug: (name, P, block, regs, local bytes, static smem, max blocks/SM) for each production kernel
+std::vector<AttrRow> kernel_attrs() {
+  std::vector<AttrRow> rows;
+  attr_row(rows, "topk_partial_kernel", 0, BLOCK, topk_partial_kernel<PARTIAL_ALL>);
+  merge_attr_rows<32>(rows);
+  merge_attr_rows<64>(rows);
+  merge_attr_rows<128>(rows);
+  merge_attr_rows<256>(rows);
+  merge_attr_rows<512>(rows);
+  merge_attr_rows<1024>(rows);
+  return rows;
 }
