@@ -10,6 +10,8 @@ std::vector<torch::Tensor> stages_fused(torch::Tensor logits, int64_t top_k, dou
                                         int64_t seed, int64_t offset, int64_t splits_override);
 torch::Tensor probe_phase(torch::Tensor logits, int64_t top_k, double top_p, int64_t phase,
                           int64_t splits_override);
+std::vector<std::tuple<std::string, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>>
+kernel_attrs();
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("probe_noop", &probe_noop, "launch floor: allocate [B] and write it");
@@ -19,4 +21,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("topk_fused", &topk_fused, "debug: the selected candidate ids, descending");
   m.def("stages_fused", &stages_fused, "debug: (token_ids, keep, renormed) for Gate A");
   m.def("probe_phase", &probe_phase, "ablation: run phases 1..n of the pipeline and stop");
+  m.def("kernel_attrs", &kernel_attrs, "debug: registers, spills, smem, occupancy per kernel");
 }

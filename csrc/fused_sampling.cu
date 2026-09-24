@@ -585,3 +585,34 @@ std::vector<torch::Tensor> stages_fused(torch::Tensor logits, int64_t top_k, dou
   }
   return {out, keep, renormed};
 }
+
+using AttrRow = std::tuple<std::string, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
+
+template <typename F>
+static void attr_row(std::vector<AttrRow>& rows, const char* name, int P, int block, F* fn) {
+  cudaFuncAttributes a;
+  C10_CUDA_CHECK(cudaFuncGetAttributes(&a, fn));
+  int blocks = 0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fn, block, 0));
+  rows.emplace_back(name, P, block, a.numRegs, static_cast<int64_t>(a.localSizeBytes),
+                    static_cast<int64_t>(a.sharedSizeBytes), blocks);
+}
+
+template <int P>
+static void merge_attr_rows(std::vector<AttrRow>& rows) {
+  attr_row(rows, "merge_sample_kernel<bf16>", P, MERGE_BLOCK, merge_sample_kernel<true, MERGE_ALL, P>);
+  attr_row(rows, "merge_sample_kernel<fp16>", P, MERGE_BLOCK, merge_sample_kernel<false, MERGE_ALL, P>);
+}
+
+// debug: (name, P, block, regs, local bytes, static smem, max blocks/SM) for each production kernel
+std::vector<AttrRow> kernel_attrs() {
+  std::vector<AttrRow> rows;
+  attr_row(rows, "topk_partial_kernel", 0, BLOCK, topk_partial_kernel<PARTIAL_ALL>);
+  merge_attr_rows<32>(rows);
+  merge_attr_rows<64>(rows);
+  merge_attr_rows<128>(rows);
+  merge_attr_rows<256>(rows);
+  merge_attr_rows<512>(rows);
+  merge_attr_rows<1024>(rows);
+  return rows;
+}
